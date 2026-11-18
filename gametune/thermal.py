@@ -1,7 +1,6 @@
 # ==============================================================================
 # Program: thermal.py
 # Programmer: Ethan-da-Tech-Wizard
-# Course: CIS 156 / Advanced Systems
 # Last Modified: November 18, 2026
 # Purpose: Hardware thermal monitor reading Linux hwmon inputs with safety abort limits.
 # ==============================================================================

@@ -1,7 +1,6 @@
 # ==============================================================================
 # Program: hardware.py
 # Programmer: Ethan-da-Tech-Wizard
-# Course: CIS 156 / Advanced Systems
 # Last Modified: November 18, 2026
 # Purpose: Linux hardware inspection engine for CPU topologies, GPU cards, VRAM, and system RAM.
 # ==============================================================================

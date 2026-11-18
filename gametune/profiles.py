@@ -1,7 +1,6 @@
 # ==============================================================================
 # Program: profiles.py
 # Programmer: Ethan-da-Tech-Wizard
-# Course: CIS 156 / Advanced Systems
 # Last Modified: November 18, 2026
 # Purpose: Reversible PC optimization profiles (process priority, memory compaction, shader cache).
 # ==============================================================================
