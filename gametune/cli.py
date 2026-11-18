@@ -1,0 +1,171 @@
+"""Command line. Plain sentences, no colour, every command also supports --json."""
+import argparse
+import json
+import sys
+
+from . import __version__, hardware, paths, profiles, report, selftest, thermal
+
+ANTICHEAT = ("Warning: do not use overlays or launch wrappers with games that use anti-cheat unless the publisher says it is allowed. "
+             "gametune never touches game files.")
+
+
+def _out(args, data, lines):
+    if args.json:
+        print(json.dumps(data, indent=2, default=str))
+    else:
+        for ln in lines:
+            print(ln)
+
+
+def cmd_scan(args):
+    info = hardware.scan()
+    _out(args, info, hardware.describe(info))
+    return 0
+
+
+def cmd_thermal(args):
+    s = thermal.sample()
+    state, msg = thermal.evaluate(s["gpu_c"], s["cpu_c"], True)
+    fmt = lambda v: "%.0f C" % v if v is not None else "not readable"
+    lines = ["GPU temperature: %s." % fmt(s["gpu_c"]), "CPU temperature: %s." % fmt(s["cpu_c"]),
+             "Guard result: %s. %s" % (state, msg),
+             "Limits: heavy work starts at GPU 84 C or lower, pauses at 86 C, stops at 91 C. gametune never allows 97 C and never overclocks."]
+    _out(args, {"sample": s, "state": state, "message": msg}, lines)
+    return {thermal.OK: 0, thermal.UNKNOWN: 2}.get(state, 1)
+
+
+def cmd_selftest(args):
+    r = selftest.run(seconds=args.seconds, scene=args.scene, mangohud_path=args.mangohud_path,
+                     allow_unknown_temp=args.allow_unknown_temp)
+    _out(args, r, r["lines"] + ["RESULT: %s" % r["status"]])
+    return {"OK": 0, "SKIPPED": 2, "REFUSED_HOT": 3, "REFUSED_UNKNOWN_TEMP": 3, "ABORTED_HOT": 3}.get(r["status"], 1)
+
+
+def cmd_profiles(args):
+    data, lines = [], []
+    for p in profiles.list_profiles(args.experimental):
+        label = "ESTABLISHED idea, still measure it" if p.evidence == "established" else "UNPROVEN, test it"
+        lines.append("%s [%s%s]: %s Options: %s" % (p.name, label, "" if p.default_on else ", off by default", p.summary, p.params))
+        data.append({"name": p.name, "evidence": p.evidence, "default_on": p.default_on, "summary": p.summary})
+    if not args.experimental:
+        lines.append("Unproven profiles are hidden. Show them with: gametune profiles --experimental")
+    for name, why in profiles.NOT_OFFERED:
+        lines.append("Not offered: %s. %s" % (name, why))
+    lines.append("No profile is proven on your PC until `gametune report` says IMPROVED for your game.")
+    _out(args, data, lines)
+    return 0
+
+
+def cmd_apply(args):
+    try:
+        if args.profile not in profiles.PROFILES:
+            raise profiles.ProfileError("Unknown profile %s. Run: gametune profiles" % args.profile)
+        prof = profiles.PROFILES[args.profile]
+        if not prof.default_on and not args.experimental:
+            raise profiles.ProfileError("%s is unproven and off by default. Add --experimental if you want to test it." % args.profile)
+        info = hardware.scan()
+        hw = {"gpu_vendor": hardware.primary_gpu_vendor(info), "performance_cpus": info["cpu"]["performance_cpus"]}
+        params = {k: v for k, v in (("scale", args.scale), ("output", args.output), ("fps", args.fps)) if v is not None}
+        pl = profiles.plan(args.game, add=(args.profile, params), hw=hw)
+        s = thermal.sample()
+        state, msg = thermal.evaluate(s["gpu_c"], s["cpu_c"], False)
+        lines = ["Thermal check: %s" % msg]
+        for p, (data, _m) in sorted(pl["files"].items()):
+            lines.append("%s %s" % ("WILL WRITE" if args.yes else "WOULD WRITE (dry run)", p))
+        launch = pl["targets"]["launch"]
+        if launch in pl["files"]:
+            lines.append("Steam launch options would be: " + pl["files"][launch][0].decode().strip())
+        lines += pl["notes"]
+        if prof.kind != "advice":
+            lines.append(ANTICHEAT)
+        if args.yes:
+            profiles.apply_plan(args.game, pl, "apply " + args.profile)
+            lines.append("Done. Paste the launch options into the game's Steam Launch Options. Undo with: gametune revert %s --game %s" % (args.profile, args.game))
+        else:
+            lines.append("Dry run: nothing was written. Add --yes to write these files.")
+        _out(args, {"dry_run": not args.yes, "files": sorted(pl["files"]), "profiles": pl["profiles"]}, lines)
+        return 0
+    except profiles.ProfileError as exc:
+        print("Cannot apply: %s" % exc)
+        return 1
+
+
+def cmd_revert(args):
+    if not args.all and not (args.profile and args.game):
+        print("Use: gametune revert PROFILE --game NAME   or   gametune revert --all")
+        return 1
+    try:
+        results = []
+        if args.all:
+            games = [args.game] if args.game else profiles.all_games()
+            if not games:
+                results.append((True, "Nothing to undo."))
+            for g in games:
+                results.append(profiles.revert_game(g, args.force))
+        else:
+            results.append(profiles.revert_profile(args.game, args.profile, force=args.force))
+    except profiles.ProfileError as exc:
+        print("Cannot revert: %s" % exc)
+        return 1
+    _out(args, [{"ok": ok, "message": m} for ok, m in results], [m for _ok, m in results])
+    return 0 if all(ok for ok, _ in results) else 1
+
+
+def cmd_report(args):
+    rep = report.build(report.expand(args.baseline), report.expand(args.tuned), warmup_s=args.warmup, min_runs=args.runs)
+    jpath, tpath = report.save(rep)
+    if args.json:
+        rep["saved"] = [jpath, tpath]
+        print(json.dumps(rep, indent=2))
+    else:
+        print(report.render_text(rep), end="")
+        print("Saved on this computer only: %s and %s" % (jpath, tpath))
+    return 0 if rep["verdict"] != "NOT ENOUGH DATA" else 2
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="gametune", description="Honest game performance helper. Local only. No telemetry. No network.")
+    ap.add_argument("--version", action="version", version="gametune " + __version__)
+    sub = ap.add_subparsers(dest="cmd")
+    def add(name, fn, help_):
+        p = sub.add_parser(name, help=help_)
+        p.add_argument("--json", action="store_true", help="machine-readable output")
+        p.set_defaults(fn=fn)
+        return p
+    add("scan", cmd_scan, "detect this PC's hardware and helper tools")
+    add("thermal", cmd_thermal, "read temperatures and apply the thermal guard")
+    p = add("selftest", cmd_selftest, "headless check that measuring works (no real game)")
+    p.add_argument("--seconds", type=int, default=10, help="scene length, 3 to 20")
+    p.add_argument("--scene", choices=["auto", "vkcube", "vkmark"], default="auto")
+    p.add_argument("--mangohud-path", help="mangohud program, or an extracted tree containing usr/")
+    p.add_argument("--allow-unknown-temp", action="store_true", help="run even if no temperature sensor can be read")
+    p = add("profiles", cmd_profiles, "list safe, undoable profiles")
+    p.add_argument("--experimental", action="store_true", help="also list unproven profiles")
+    p = add("apply", cmd_apply, "write launch options for a profile (dry run unless --yes)")
+    p.add_argument("profile")
+    p.add_argument("--game", required=True)
+    p.add_argument("--yes", action="store_true", help="really write the files")
+    p.add_argument("--experimental", action="store_true")
+    p.add_argument("--scale"); p.add_argument("--output"); p.add_argument("--fps")
+    p = add("revert", cmd_revert, "undo applied profiles exactly")
+    p.add_argument("profile", nargs="?")
+    p.add_argument("--game"); p.add_argument("--all", action="store_true"); p.add_argument("--force", action="store_true")
+    p = add("report", cmd_report, "compare real MangoHud logs before and after")
+    p.add_argument("--baseline", nargs="+", required=True, help="baseline log files or folders")
+    p.add_argument("--tuned", nargs="+", required=True, help="tuned log files or folders")
+    p.add_argument("--runs", type=int, default=3, help="runs needed per side (minimum 3)")
+    p.add_argument("--warmup", type=float, default=5.0, help="seconds thrown away at the start of each run")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if not getattr(args, "fn", None):
+        ap.print_help()
+        return 0
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

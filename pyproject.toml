@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gametune"
+version = "0.1.0"
+description = "Honest, local-only game performance helper: measures before it claims anything."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+gametune = "gametune.cli:main"
+
+[tool.setuptools]
+packages = ["gametune"]

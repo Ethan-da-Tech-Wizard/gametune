@@ -1,0 +1,243 @@
+"""Hardware detection. Reads /proc and /sys (under an optional fake root for tests); nothing is hard-coded."""
+import os
+import re
+import shutil
+
+from . import thermal
+
+HELPERS = ("mangohud", "gamescope", "gamemoderun", "vkmark", "vkcube")
+VENDORS = {"0x10de": "NVIDIA", "0x1002": "AMD", "0x8086": "Intel"}
+
+
+def _read(path):
+    try:
+        with open(path, "r") as handle:
+            return handle.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def parse_cpulist(text):
+    """'0-11,14' -> [0..11, 14]. Bad text gives []."""
+    result = []
+    for part in (text or "").strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                lo, hi = part.split("-", 1)
+                result.extend(range(int(lo), int(hi) + 1))
+            else:
+                result.append(int(part))
+        except ValueError:
+            return []
+    return sorted(set(result))
+
+
+def format_cpulist(cpus):
+    cpus = sorted(set(cpus))
+    parts = []
+    start = prev = None
+    for cpu in cpus:
+        if start is None:
+            start = prev = cpu
+        elif cpu == prev + 1:
+            prev = cpu
+        else:
+            parts.append((start, prev))
+            start = prev = cpu
+    if start is not None:
+        parts.append((start, prev))
+    return ",".join(str(a) if a == b else "%d-%d" % (a, b) for a, b in parts)
+
+
+def detect_cpu(root="/"):
+    info = {"model": None, "logical_cpus": None, "physical_cores": None,
+            "hybrid": False, "performance_cpus": None, "efficiency_cpus": None, "hybrid_source": None}
+    text = _read(os.path.join(root, "proc", "cpuinfo")) or ""
+    logical = 0
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key == "processor":
+            logical += 1
+        elif key in ("model name", "Hardware", "Processor", "cpu model") and info["model"] is None and value.strip():
+            info["model"] = value.strip()
+    cpu_dir = os.path.join(root, "sys", "devices", "system", "cpu")
+    cpu_ids = []
+    try:
+        cpu_ids = sorted(int(n[3:]) for n in os.listdir(cpu_dir) if re.match(r"^cpu\d+$", n))
+    except OSError:
+        pass
+    info["logical_cpus"] = logical or (len(cpu_ids) or None)
+    cores = set()
+    for cid in cpu_ids:
+        core = _read(os.path.join(cpu_dir, "cpu%d" % cid, "topology", "core_id"))
+        pkg = _read(os.path.join(cpu_dir, "cpu%d" % cid, "topology", "physical_package_id"))
+        if core is not None:
+            cores.add((pkg, core))
+    if cores:
+        info["physical_cores"] = len(cores)
+    # Hybrid CPUs. Intel exposes cpu_core / cpu_atom; others expose differing cpu_capacity.
+    p = parse_cpulist(_read(os.path.join(root, "sys", "devices", "cpu_core", "cpus")))
+    e = parse_cpulist(_read(os.path.join(root, "sys", "devices", "cpu_atom", "cpus")))
+    lp = parse_cpulist(_read(os.path.join(root, "sys", "devices", "cpu_lowpower", "cpus")))
+    if p and (e or lp):
+        info.update(hybrid=True, performance_cpus=format_cpulist(p),
+                    efficiency_cpus=format_cpulist(e + lp), hybrid_source="sysfs cpu_core/cpu_atom")
+    else:
+        caps = {}
+        for cid in cpu_ids:
+            raw = _read(os.path.join(cpu_dir, "cpu%d" % cid, "cpu_capacity"))
+            if raw is not None and raw.isdigit():
+                caps[cid] = int(raw)
+        if len(set(caps.values())) > 1:
+            top = max(caps.values())
+            info.update(hybrid=True,
+                        performance_cpus=format_cpulist([c for c, v in caps.items() if v == top]),
+                        efficiency_cpus=format_cpulist([c for c, v in caps.items() if v != top]),
+                        hybrid_source="sysfs cpu_capacity")
+    return info
+
+
+def detect_ram(root="/"):
+    text = _read(os.path.join(root, "proc", "meminfo")) or ""
+    match = re.search(r"^MemTotal:\s+(\d+)\s*kB", text, re.M)
+    total_kib = int(match.group(1)) if match else None
+    return {"total_mib": total_kib // 1024 if total_kib else None}
+
+
+def _parse_lspci(text):
+    """Parse `lspci -mm -nn` lines for display controllers -> {'vendor:device': 'Vendor Device name'}."""
+    names = {}
+    for line in (text or "").splitlines():
+        if not re.search(r"VGA compatible|3D controller|Display controller", line):
+            continue
+        parts = re.findall(r'"([^"]*)"', line)
+        if len(parts) < 3:
+            continue
+        ids = re.findall(r"\[([0-9a-f]{4})\]", parts[1] + " " + parts[2])
+        if len(ids) < 2:
+            continue
+        clean = lambda s: re.sub(r"\s*\[[0-9a-f]{4}\]", "", s).strip()
+        names[(ids[0] + ":" + ids[1]).lower()] = (clean(parts[1]) + " " + clean(parts[2])).strip()
+    return names
+
+
+def detect_gpus(root="/", runner=thermal.run_text):
+    gpus = []
+    names = _parse_lspci(runner(["lspci", "-mm", "-nn"]))
+    drm = os.path.join(root, "sys", "class", "drm")
+    try:
+        cards = sorted((c for c in os.listdir(drm) if re.match(r"^card\d+$", c)), key=lambda c: int(c[4:]))
+    except OSError:
+        cards = []
+    for card in cards:
+        dev = os.path.join(drm, card, "device")
+        vid = (_read(os.path.join(dev, "vendor")) or "").lower()
+        did = (_read(os.path.join(dev, "device")) or "").lower()
+        if not vid:
+            continue
+        vram = _read(os.path.join(dev, "mem_info_vram_total"))
+        key = (vid[2:] + ":" + did[2:]).lower()
+        gpus.append({"card": card, "vendor": VENDORS.get(vid, "Other (" + vid + ")"), "vendor_id": vid,
+                     "name": names.get(key), "vram_mib": int(vram) // (1024 * 1024) if vram and vram.isdigit() else None,
+                     "driver": os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) if os.path.islink(os.path.join(dev, "driver")) else None,
+                     "kind": None})
+    if not gpus:
+        for key, name in names.items():
+            vid = "0x" + key.split(":")[0]
+            gpus.append({"card": None, "vendor": VENDORS.get(vid, "Other"), "vendor_id": vid, "name": name,
+                         "vram_mib": None, "driver": None, "kind": None})
+    # NVIDIA details from nvidia-smi (the driver's own report is more exact than sysfs).
+    out = runner(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"])
+    smi = []
+    for line in (out or "").splitlines():
+        cols = [c.strip() for c in line.split(",")]
+        if len(cols) >= 3:
+            try:
+                smi.append((cols[0], int(float(cols[1])), cols[2]))
+            except ValueError:
+                pass
+    nv = [g for g in gpus if g["vendor"] == "NVIDIA"]
+    for i, (name, vram, drv) in enumerate(smi):
+        target = nv[i] if i < len(nv) else None
+        if target is None:
+            target = {"card": None, "vendor": "NVIDIA", "vendor_id": "0x10de", "name": None, "vram_mib": None,
+                      "driver": None, "kind": None}
+            gpus.append(target)
+        target.update(name=name, vram_mib=vram, driver="nvidia " + drv)
+    for g in gpus:
+        if g["vendor"] == "NVIDIA":
+            g["kind"] = "discrete"
+        elif g["vendor"] == "AMD":
+            g["kind"] = "discrete (guess)" if (g["vram_mib"] or 0) >= 2048 else "integrated (guess)"
+        elif g["vendor"] == "Intel":
+            g["kind"] = "integrated (guess)"
+        else:
+            g["kind"] = "unknown"
+    return gpus
+
+
+def detect_session(environ=None):
+    env = os.environ if environ is None else environ
+    stype = env.get("XDG_SESSION_TYPE") or None
+    if not stype:
+        stype = "wayland" if env.get("WAYLAND_DISPLAY") else ("x11" if env.get("DISPLAY") else "unknown")
+    return {"type": stype.lower(), "wayland_display": bool(env.get("WAYLAND_DISPLAY")), "x_display": bool(env.get("DISPLAY"))}
+
+
+def detect_helpers(which=shutil.which):
+    return {name: which(name) for name in HELPERS}
+
+
+def scan(root="/", runner=thermal.run_text, environ=None, which=shutil.which):
+    sample = thermal.sample(root, runner)
+    return {
+        "cpu": detect_cpu(root),
+        "gpus": detect_gpus(root, runner),
+        "ram": detect_ram(root),
+        "session": detect_session(environ),
+        "helpers": detect_helpers(which),
+        "thermal_sensors": {"gpu_readable": sample["gpu_c"] is not None, "cpu_readable": sample["cpu_c"] is not None},
+    }
+
+
+def primary_gpu_vendor(info):
+    gpus = info.get("gpus") or []
+    for g in gpus:
+        if g.get("kind") == "discrete":
+            return g["vendor"]
+    return gpus[0]["vendor"] if gpus else None
+
+
+def describe(info):
+    """Plain sentences, one fact per line."""
+    lines = []
+    cpu = info["cpu"]
+    lines.append("CPU: %s." % (cpu["model"] or "model not found"))
+    lines.append("CPU threads: %s. Physical cores: %s." % (cpu["logical_cpus"] if cpu["logical_cpus"] is not None else "unknown",
+                                                          cpu["physical_cores"] if cpu["physical_cores"] is not None else "unknown"))
+    if cpu["hybrid"]:
+        lines.append("Hybrid CPU: yes. Performance threads: %s. Efficiency threads: %s. (found by %s)" % (
+            cpu["performance_cpus"], cpu["efficiency_cpus"], cpu["hybrid_source"]))
+    else:
+        lines.append("Hybrid CPU: no (no performance and efficiency core split was found).")
+    if not info["gpus"]:
+        lines.append("GPU: none found.")
+    for i, g in enumerate(info["gpus"], 1):
+        vram = "%d MiB video memory" % g["vram_mib"] if g["vram_mib"] else "video memory unknown"
+        nm = g["name"] or "(model not found)"
+        label = nm if g["vendor"].lower() in nm.lower() else "%s %s" % (g["vendor"], nm)
+        lines.append("GPU %d: %s, %s, %s, driver %s." % (i, label, g["kind"], vram, g["driver"] or "unknown"))
+    ram = info["ram"]["total_mib"]
+    lines.append("Memory (RAM): %s." % ("%d MiB" % ram if ram else "unknown"))
+    s = info["session"]
+    lines.append("Session type: %s." % s["type"])
+    for name, path in info["helpers"].items():
+        lines.append("Helper %s: %s." % (name, ("installed at " + path) if path else "NOT installed"))
+    ts = info["thermal_sensors"]
+    lines.append("GPU temperature sensor: %s." % ("readable" if ts["gpu_readable"] else "NOT readable"))
+    lines.append("CPU temperature sensor: %s." % ("readable" if ts["cpu_readable"] else "NOT readable"))
+    return lines
