@@ -1,3 +1,11 @@
+# ==============================================================================
+# Program: stats.py
+# Programmer: Ethan-da-Tech-Wizard
+# Course: CIS 156 / Advanced Systems
+# Last Modified: November 18, 2026
+# Purpose: Statistical distribution calculations including frame-time percentiles, 1% lows, and smoothness variance.
+# ==============================================================================
+
 """Frame statistics and the noise-aware comparison rule. Plain python, no numpy.
 
 Definitions (stated in every report):

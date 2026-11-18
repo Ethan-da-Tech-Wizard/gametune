@@ -1,3 +1,11 @@
+# ==============================================================================
+# Program: selftest.py
+# Programmer: Ethan-da-Tech-Wizard
+# Course: CIS 156 / Advanced Systems
+# Last Modified: November 18, 2026
+# Purpose: Self-test verification module ensuring measurement prerequisites are functioning.
+# ==============================================================================
+
 """Headless measurement check: proves the MangoHud logging and parsing chain works, with NO real game.
 
 It runs a tiny Vulkan scene (vkmark, else vkcube) inside `gamescope --backend headless` with MangoHud logging

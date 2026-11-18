@@ -1,3 +1,11 @@
+# ==============================================================================
+# Program: thermal.py
+# Programmer: Ethan-da-Tech-Wizard
+# Course: CIS 156 / Advanced Systems
+# Last Modified: November 18, 2026
+# Purpose: Hardware thermal monitor reading Linux hwmon inputs with safety abort limits.
+# ==============================================================================
+
 """Thermal guard shared by selftest and apply.
 
 Default limits (degrees Celsius). They can be made STRICTER by the caller, never looser:

@@ -1,3 +1,11 @@
+# ==============================================================================
+# Program: mangohud.py
+# Programmer: Ethan-da-Tech-Wizard
+# Course: CIS 156 / Advanced Systems
+# Last Modified: November 18, 2026
+# Purpose: MangoHud launch option generator and CSV frame-time log parser.
+# ==============================================================================
+
 """Parser for MangoHud frame-time logs (the CSV files MangoHud writes with logging on).
 
 Layout (MangoHud 0.6 to 0.8):

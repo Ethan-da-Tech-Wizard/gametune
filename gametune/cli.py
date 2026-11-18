@@ -1,3 +1,11 @@
+# ==============================================================================
+# Program: cli.py
+# Programmer: Ethan-da-Tech-Wizard
+# Course: CIS 156 / Advanced Systems
+# Last Modified: November 18, 2026
+# Purpose: Command-line interface argument parsing, JSON serialization, and sub-command routing.
+# ==============================================================================
+
 """Command line. Plain sentences, no colour, every command also supports --json."""
 import argparse
 import json
