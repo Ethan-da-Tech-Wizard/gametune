@@ -69,8 +69,10 @@ def cmd_profiles(args):
     "Established" ideas are still unproven for a given PC until `report` says so;
     experimental ones are hidden unless --experimental is passed.
     """
+    # Collect both machine-readable and text forms in one pass.
     data, lines = [], []
     for p in profiles.list_profiles(args.experimental):
+        # Wording is deliberate: even "established" profiles are never claimed to help until measured.
         label = "ESTABLISHED idea, still measure it" if p.evidence == "established" else "UNPROVEN, test it"
         lines.append("%s [%s%s]: %s Options: %s" % (p.name, label, "" if p.default_on else ", off by default", p.summary, p.params))
         data.append({"name": p.name, "evidence": p.evidence, "default_on": p.default_on, "summary": p.summary})
@@ -104,6 +106,7 @@ def cmd_apply(args):
         # plan() is pure: it computes the file contents without touching the disk.
         pl = profiles.plan(args.game, add=(args.profile, params), hw=hw)
         s = thermal.sample()
+        # Informational only here (False = not starting heavy work): applying a profile just writes text files.
         state, msg = thermal.evaluate(s["gpu_c"], s["cpu_c"], False)
         lines = ["Thermal check: %s" % msg]
         for p, (data, _m) in sorted(pl["files"].items()):
@@ -112,6 +115,7 @@ def cmd_apply(args):
         if launch in pl["files"]:
             lines.append("Steam launch options would be: " + pl["files"][launch][0].decode().strip())
         lines += pl["notes"]
+        # Advice-only profiles add no overlay or wrapper, so the anti-cheat warning is not needed.
         if prof.kind != "advice":
             lines.append(ANTICHEAT)
         # Only now does anything get written to disk.
@@ -132,6 +136,7 @@ def cmd_revert(args):
 
     Returns 0 only if every revert succeeded.
     """
+    # Need either a specific profile+game, or --all.
     if not args.all and not (args.profile and args.game):
         print("Use: gametune revert PROFILE --game NAME   or   gametune revert --all")
         return 1
@@ -157,6 +162,7 @@ def cmd_report(args):
 
     Exit status 2 means NOT ENOUGH DATA so scripts can tell "no claim" from success.
     """
+    # expand() turns folders into their CSV logs before parsing.
     rep = report.build(report.expand(args.baseline), report.expand(args.tuned), warmup_s=args.warmup, min_runs=args.runs)
     jpath, tpath = report.save(rep)
     if args.json:
@@ -181,6 +187,7 @@ def build_parser():
         return p
     add("scan", cmd_scan, "detect this PC's hardware and helper tools")
     add("thermal", cmd_thermal, "read temperatures and apply the thermal guard")
+    # Per-command options are attached to the parser returned by add().
     p = add("selftest", cmd_selftest, "headless check that measuring works (no real game)")
     p.add_argument("--seconds", type=int, default=10, help="scene length, 3 to 20")
     p.add_argument("--scene", choices=["auto", "vkcube", "vkmark"], default="auto")

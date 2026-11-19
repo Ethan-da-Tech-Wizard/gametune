@@ -51,6 +51,8 @@ def parse_text(text, path="<text>"):
     Rows that are damaged or cut off are counted in `skipped_rows` instead of
     failing the whole file, because logs are often truncated when a game exits.
     """
+    # Blank lines are discarded so row positions are stable.
+    # Blank lines are discarded so row positions are stable.
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
         raise LogError("The log file is empty.")
@@ -64,6 +66,7 @@ def parse_text(text, path="<text>"):
             break
     if col_idx is None:
         raise LogError("No MangoHud column line (with 'frametime' or 'fps') was found. This does not look like a MangoHud frame log.")
+    # Re-split the chosen line; names are lower-cased so matching ignores case.
     cols = [c.strip().lower() for c in lines[col_idx].split(",")]
     # Summary CSVs start with a header row like "os,cpu,gpu,..." and have no frame data.
     if "os" in cols and "cpu" in cols and "frametime" not in cols:
@@ -80,7 +83,9 @@ def parse_text(text, path="<text>"):
     el_i = cols.index("elapsed") if "elapsed" in cols else None
     gt_i = cols.index("gpu_temp") if "gpu_temp" in cols else None
     ct_i = cols.index("cpu_temp") if "cpu_temp" in cols else None
+    # Parallel output lists: one entry per accepted frame.
     frametimes, times, gtemps, ctemps = [], [], [], []
+    # Count of rows rejected (short, non-numeric or non-positive frame time).
     skipped = 0
     cumulative = 0.0
     for ln in lines[col_idx + 1:]:
@@ -97,6 +102,7 @@ def parse_text(text, path="<text>"):
         if ft is None or ft <= 0 or ft != ft:
             skipped += 1
             continue
+        # Running clock in seconds, used when there is no usable elapsed column.
         cumulative += ft / 1000.0
         # `elapsed` is in nanoseconds; if absent, the running sum of frame times is used as the clock.
         t = vals[el_i] / 1e9 if el_i is not None and vals[el_i] is not None else cumulative
@@ -106,6 +112,7 @@ def parse_text(text, path="<text>"):
             gtemps.append(vals[gt_i])
         if ct_i is not None and vals[ct_i] is not None:
             ctemps.append(vals[ct_i])
+    # A header with zero usable rows is as useless as no file at all.
     if not frametimes:
         raise LogError("The log has a header but no usable frame rows.")
     return FrameLog(path, header, frametimes, times, gtemps, ctemps, skipped)

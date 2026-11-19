@@ -71,6 +71,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
     """Returns a result dict with status OK / SKIPPED / FAILED / REFUSED_HOT and plain 'lines'."""
     # Clamp to 3..20 s.
     seconds = max(3, min(int(seconds), MAX_SECONDS))
+    # Result record; `status` is filled in by whichever branch ends the run.
     res = {"status": None, "lines": [], "missing": [], "stats": None, "command": None, "scene": None}
     # Shorthand alias for the human-readable report lines.
     L = res["lines"]
@@ -85,7 +86,9 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
         missing.append("gamescope")
     if mh_prefix is None:
         missing.append("mangohud")
+    # Scene program picked below; stays None if neither vkcube nor vkmark exists.
     chosen = None
+    # In auto mode vkcube is tried first (smaller dependency), then vkmark.
     order = ["vkcube", "vkmark"] if scene == "auto" else [scene]
     for cand in order:
         if cand in ("vkcube", "vkmark") and which(cand):
@@ -116,6 +119,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
 
     # Scratch folder is removed afterwards (see finally) unless the caller supplied keep_dir.
     tmp = keep_dir or tempfile.mkdtemp(prefix="gametune-selftest-")
+    # Only delete folders this function created itself.
     own_tmp = keep_dir is None
     try:
         # An empty MangoHud config file stops a user's own config from changing the test.
@@ -123,6 +127,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
         open(conf, "w").close()
         logdir = os.path.join(tmp, "logs")
         os.makedirs(logdir)
+        # Copy the environment so the parent process is not modified.
         env = dict(os.environ)
         env.update(mh_env)
         env["MANGOHUD_CONFIGFILE"] = conf
@@ -138,6 +143,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
         L.append("Running (at most %d s, hard limit %d s): %s" % (seconds + 3, MAX_SECONDS + 5, " ".join(cmd)))
         errlog = os.path.join(tmp, "stderr.txt")
         with open(errlog, "w") as ef:
+            # start_new_session puts the child in its own process group, which is what _stop_group signals.
             proc = subprocess.Popen(cmd, env=env, stdout=ef, stderr=subprocess.STDOUT, start_new_session=True)
         L.append("Started process group %d (the only one this test will signal)." % proc.pid)
         start = time.time()
@@ -163,6 +169,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
             return res
         # A run that produced no frame log is a real FAILED result: the measuring chain is broken.
         logs = [p for p in glob.glob(os.path.join(logdir, "*.csv")) if not p.endswith("_summary.csv")]
+        # Keep the last 600 characters of the run's output for failure diagnostics.
         tail = ""
         try:
             with open(errlog, "r", errors="replace") as ef:
@@ -176,6 +183,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
                 L.append("Last output of the run: " + tail.replace("\n", " | "))
             return res
         try:
+            # Use the newest log in case more than one was written.
             log = mangohud.parse_file(max(logs, key=os.path.getmtime))
         except mangohud.LogError as exc:
             res["status"] = "FAILED"

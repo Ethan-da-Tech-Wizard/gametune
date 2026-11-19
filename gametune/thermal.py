@@ -144,6 +144,7 @@ def read_gpu_temp(root="/", runner=run_text):
     # `root` lets tests point at a fake filesystem tree instead of the real /sys.
     drm = os.path.join(root, "sys", "class", "drm")
     try:
+        # Only top-level "cardN" nodes; entries such as card0-HDMI-A-1 are connectors, not GPUs.
         cards = [c for c in os.listdir(drm) if re.match(r"^card\d+$", c)]
     except OSError:
         cards = []
@@ -168,6 +169,7 @@ def read_cpu_temp(root="/"):
         entries = sorted(os.listdir(base))
     except OSError:
         return None
+    # Track the hottest CPU sensor group found across all hwmon devices.
     best = None
     for entry in entries:
         folder = os.path.join(base, entry)
@@ -181,6 +183,7 @@ def read_cpu_temp(root="/"):
         except OSError:
             continue
         for fname in files:
+            # Each sensor is tempN_input with an optional tempN_label describing it.
             match = re.match(r"^temp(\d+)_input$", fname)
             if not match:
                 continue

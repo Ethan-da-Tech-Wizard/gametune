@@ -40,6 +40,7 @@ class Piece(object):
     """What one profile adds to the launch line."""
 
     def __init__(self):
+        # Environment variables to set (name -> value).
         self.env = {}
         self.prefix = []        # commands before gamescope (gamemoderun, taskset ...)
         self.gamescope = []     # gamescope arguments
@@ -62,14 +63,17 @@ def _render_scale(params, hw):
     Validates --output (WxH) and --scale (0.3 to 1.0) before building anything.
     """
     out = params.get("output", "1920x1080")
+    # Accept only WxH with 3-5 digit sizes; anything else could not be a real display mode.
     m = re.match(r"^(\d{3,5})x(\d{3,5})$", out)
     if not m:
         raise ProfileError("--output must look like 1920x1080.")
     W, H = int(m.group(1)), int(m.group(2))
     try:
+        # Default 0.75: a 25% cut in each dimension, a common balance of speed and sharpness.
         s = float(params.get("scale", "0.75"))
     except ValueError:
         raise ProfileError("--scale must be a number such as 0.75.")
+    # Below 0.3 the image is unusable; above 1.0 would be supersampling, not a speed-up.
     if not 0.3 <= s <= 1.0:
         raise ProfileError("--scale must be between 0.3 and 1.0.")
     p = Piece()
@@ -100,6 +104,7 @@ def _measure(params, hw):
     the length, and log_interval=0 means one row per frame (not sampled).
     """
     p = Piece()
+    # Logs go inside gametune's own data folder unless told otherwise.
     folder = params.get("log_folder") or paths.sub("logs")
     p.mangohud = ["output_folder=" + folder, "autostart_log=%s" % params.get("delay", "5"),
                   "log_duration=%s" % params.get("seconds", "90"), "log_interval=0"]
@@ -113,6 +118,7 @@ def _shader_cache(params, hw):
     Chooses the NVIDIA or Mesa environment variable from the detected GPU vendor.
     """
     p = Piece()
+    # `hw` may be None when no scan was done; (hw or {}) keeps that case safe.
     vendor = (hw or {}).get("gpu_vendor")
     if vendor == "NVIDIA":
         p.env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"] = "1"
@@ -197,9 +203,11 @@ def list_profiles(experimental=False):
 
 def running_heavy_apps(root="/"):
     """Read-only look at /proc for well-known memory-hungry programs. Returns [(name, rss_mib)]."""
+    # Name -> total resident MiB, summed over all processes sharing that name (browsers run many).
     found = {}
     proc = os.path.join(root, "proc")
     try:
+        # Numeric /proc entries are process IDs.
         entries = [e for e in os.listdir(proc) if e.isdigit()]
     except OSError:
         return []
@@ -209,6 +217,7 @@ def running_heavy_apps(root="/"):
         try:
             with open(os.path.join(proc, pid, "comm")) as f:
                 comm = f.read().strip().lower()
+            # Prefix match covers names such as "firefox-bin" and "chrome-sandbox".
             if not any(h == comm or comm.startswith(h) for h in HEAVY_APPS):
                 continue
             # Second statm field is resident set size in pages.
@@ -235,9 +244,11 @@ def compose(selected, hw):
     # Sorted so the generated line is deterministic regardless of dict order.
     for name in sorted(selected):
         prof = PROFILES[name]
+        # Advice-only profiles (close-apps) contribute nothing to the launch line.
         if prof.builder is None:
             continue
         piece = prof.builder(selected[name], hw)
+        # Merge each piece; later profiles (alphabetical) override on a conflict.
         env.update(piece.env)
         prefix += piece.prefix
         gs += piece.gamescope
@@ -246,6 +257,7 @@ def compose(selected, hw):
     # MangoHud takes all options through one MANGOHUD_CONFIG variable.
     if mh:
         env["MANGOHUD_CONFIG"] = ",".join(mh)
+    # Steam launch string order: ENV=values, command prefixes, gamescope ... --, mangohud, %command%.
     parts = []
     for k in sorted(env):
         parts.append("%s=%s" % (k, shlex.quote(env[k])))
@@ -284,9 +296,13 @@ def _read_bytes(path):
 def _targets(game):
     """The four files gametune manages for a game (launch line, wrapper, state, advice)."""
     return {
+        # Steam launch options text (user pastes it into Steam).
         "launch": paths.sub("launch", game + ".launch.txt"),
+        # Executable wrapper script, for use outside Steam.
         "wrapper": paths.sub("wrappers", game + ".sh"),
+        # Which profiles are applied, so later changes can rebuild everything.
         "state": paths.sub("state", game + ".json"),
+        # Advice file written by close-apps.
         "notes": paths.sub("advice", game + ".txt"),
     }
 
@@ -304,6 +320,7 @@ def _write_atomic(path, data, mode=None):
         f.write(data)
     if mode is not None:
         os.chmod(tmp, mode)
+    # Atomic rename on the same filesystem: readers see the old or the new file, never a mix.
     os.replace(tmp, path)
 
 
@@ -317,6 +334,7 @@ def load_state(game):
 
 def plan(game, add=None, remove=None, hw=None, root="/"):
     """Work out the files that would be written. Pure; writes nothing. Returns dict path -> (bytes, mode) and summary."""
+    # Validate the name first: it is used to build paths.
     check_game(game)
     state = load_state(game)
     # Copy the saved profile set, then apply the requested add/remove to the copy.
@@ -326,6 +344,7 @@ def plan(game, add=None, remove=None, hw=None, root="/"):
     if remove:
         profiles.pop(remove, None)
     t = _targets(game)
+    # path -> (bytes, file mode) for everything that would be written.
     files = {}
     notes = []
     # With no profiles left, no files are planned; apply_plan then deletes the old ones.
@@ -338,6 +357,7 @@ def plan(game, add=None, remove=None, hw=None, root="/"):
             body = "Close these before playing (gametune never closes anything for you):\n" + (
                 "".join("  %s  about %d MiB\n" % a for a in apps) if apps else "  Nothing well-known was running.\n")
             files[t["notes"]] = (body.encode("utf-8"), 0o644)
+        # Remember the hardware facts used so a later single-profile revert can rebuild identically.
         state_out = {"game": game, "profiles": profiles, "hardware_used": {k: v for k, v in (hw or {}).items() if v}}
         files[t["state"]] = ((json.dumps(state_out, indent=2, sort_keys=True) + "\n").encode("utf-8"), 0o644)
     return {"files": files, "profiles": profiles, "notes": notes, "targets": t}
@@ -346,6 +366,7 @@ def plan(game, add=None, remove=None, hw=None, root="/"):
 def apply_plan(game, pl, label):
     """Snapshot every file we are about to touch, then write. Records an undo entry first."""
     t = pl["targets"]
+    # Every managed path, not only those being written, so files that go away are snapshotted too.
     all_paths = list(t.values())
     # Load the existing undo journal, or start a new one.
     undo = json.loads(_read_bytes(_undo_path(game)).decode("utf-8")) if _read_bytes(_undo_path(game)) else {"game": game, "records": []}
@@ -354,6 +375,7 @@ def apply_plan(game, pl, label):
     for p in all_paths:
         data = _read_bytes(p)
         snap[p] = None if data is None else base64.b64encode(data).decode("ascii")
+    # Hashes of what we write; revert later compares to detect user edits.
     after = {p: _sha(d) for p, (d, _m) in pl["files"].items()}
     undo["records"].append({"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "label": label, "before": snap, "after_sha256": after})
     _write_atomic(_undo_path(game), (json.dumps(undo, indent=2) + "\n").encode("utf-8"))   # undo record first
@@ -383,11 +405,13 @@ def revert_game(game, force=False):
     # Restore the state from before the FIRST apply, which undoes every later apply at once.
     first = undo["records"][0]["before"] if undo["records"] else {}
     for p, b64 in first.items():
+        # None records that the file did not exist before gametune; undoing means deleting it.
         if b64 is None:
             if os.path.exists(p):
                 os.remove(p)
         else:
             _write_atomic(p, base64.b64decode(b64))
+    # The journal is deleted last, after everything else was restored.
     os.remove(up)
     return True, "Restored %s to exactly how it was before gametune touched it." % game
 

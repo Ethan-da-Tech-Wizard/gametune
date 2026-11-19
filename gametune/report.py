@@ -49,6 +49,7 @@ def load_side(files, warmup_s, min_seconds, min_frames):
             continue
         # Discard the first seconds: shader compilation and asset loading make them unrepresentative.
         frames = mangohud.drop_warmup(log, warmup_s)
+        # Duration is the sum of frame times, which equals wall-clock time of the kept frames.
         seconds = sum(frames) / 1000.0
         if len(frames) < min_frames or seconds < min_seconds:
             notes.append("Skipped %s: only %d frames and %.1f seconds are left after throwing away the first %.0f seconds. "
