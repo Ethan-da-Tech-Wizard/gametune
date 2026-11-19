@@ -4,6 +4,11 @@
 # synthetic MangoHud logs and injected command runners, so no real hardware,
 # GPU tools or network are needed. Run with tests/run_tests.py.
 # ==============================================================================
+# Test strategy: nothing here touches real hardware, the network or the user's home. Every filesystem read goes through a temporary fake
+# /proc and /sys tree, every external command is replaced by an injected `runner`/`which`, and every write lands under a temp GAMETUNE_HOME.
+# Classes map to modules: ParserTests -> mangohud.py, StatsTests -> stats.py, ReportTests -> report.py, ThermalTests -> thermal.py and selftest.py,
+# HardwareTests -> hardware.py, ProfileTests -> profiles.py and cli.py. Pinned contracts are the ones users rely on: honest verdicts and exact undo.
+
 import os
 import sys
 import tempfile
@@ -15,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from gametune import hardware, mangohud, paths, profiles, report, selftest, stats, thermal  # noqa: E402
 
 # Fixture: the two-line system header MangoHud writes at the top of a log.
+# Real MangoHud writes this pair of lines first; the parser must locate the column line after them (line 3).
 HEADER = "os,cpu,gpu,ram,kernel,driver,cpuscheduler\nLinux,TestCPU,TestGPU,16000,6.1,drv1,powersave\n"
 # Fixture: the column-name line; `elapsed` is in nanoseconds.
 COLS = "fps,frametime,cpu_load,gpu_temp,cpu_temp,elapsed\n"
@@ -22,6 +28,8 @@ COLS = "fps,frametime,cpu_load,gpu_temp,cpu_temp,elapsed\n"
 
 def log_text(frametimes, gpu_temp=60, header=True, cols=COLS):
     """Build MangoHud-format CSV text from a list of frame times in milliseconds."""
+
+    # Running total of nanoseconds so each row's `elapsed` is cumulative, like a real log.
     t = 0.0
     rows = []
     for ft in frametimes:
@@ -33,6 +41,8 @@ def log_text(frametimes, gpu_temp=60, header=True, cols=COLS):
 
 def steady(fps, seconds=30, jitter=0.0):
     """Frame times for a steady `fps` run; jitter alternates +/- that fraction to add noise."""
+
+    # Number of frames for the requested duration; constant frame times make expected results easy to compute by hand.
     n = int(fps * seconds)
     base = 1000.0 / fps
     return [base * (1 + jitter * (1 if i % 2 else -1)) for i in range(n)]
@@ -44,6 +54,8 @@ class Tmp(unittest.TestCase):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
         self.dir = d.name
+
+        # Saved and restored so tests cannot leak the temp path into each other or into the developer's shell.
         old = os.environ.get("GAMETUNE_HOME")
         os.environ["GAMETUNE_HOME"] = os.path.join(self.dir, "home")
         self.addCleanup(lambda: os.environ.__setitem__("GAMETUNE_HOME", old) if old else os.environ.pop("GAMETUNE_HOME", None))
@@ -134,10 +146,13 @@ class StatsTests(unittest.TestCase):
         # 98 fast frames plus two stutters: the median ignores them, the 1% low must not.
         ft = [10.0] * 98 + [50.0, 100.0]
         m = stats.run_metrics(ft)
+
+        # 98 of 100 frames are 10 ms, so the median is exactly 10 ms = 100 FPS regardless of the two stutters.
         self.assertAlmostEqual(m["median_fps"], 100.0)
         self.assertAlmostEqual(m["low1_fps"], 1000.0 / 100.0)   # worst 1 frame of 100
         self.assertAlmostEqual(m["avg_fps"], 100.0 / (sum(ft) / 1000.0) / 1.0 * 1.0, places=6)
 
+    # `shift` makes each run a little faster than the previous one, which creates run-to-run spread without randomness (tests stay deterministic).
     def run_set(self, fps, n, jitter=0.0, shift=0.0):
         """Helper: n synthetic run-metric dicts around `fps`."""
         return [stats.run_metrics(steady(fps + shift * i, 20, jitter)) for i in range(n)]
@@ -145,12 +160,14 @@ class StatsTests(unittest.TestCase):
     def test_identical_is_no_change(self):
         """Comparing a set of runs with itself must never report a change."""
         # Three identical runs on both sides: zero difference, so any claimed change would be a false positive.
+        # `list(a)` below is a copy so the same data is compared on both sides without sharing the same list object.
         a = self.run_set(60, 3)
         self.assertEqual(stats.compare(a, list(a))[0], stats.NO_CHANGE)
 
     def test_clear_improvement(self):
         """A ~33% FPS gain well beyond the noise is IMPROVED."""
         # Baseline ~60 FPS with small run-to-run spread; tuned ~80 FPS below.
+        # The 0.1 jitter makes frame times alternate so variance inside a run is non-zero, like real gameplay.
         base = [stats.run_metrics(steady(f, 20, 0.1)) for f in (60, 61, 59)]
         tuned = [stats.run_metrics(steady(f, 20, 0.1)) for f in (80, 81, 79)]
         self.assertEqual(stats.compare(base, tuned)[0], stats.IMPROVED)
@@ -170,6 +187,8 @@ class StatsTests(unittest.TestCase):
 
     def test_too_few_runs(self):
         """Two runs per side give NOT ENOUGH DATA, and the 3-run minimum cannot be lowered by the caller."""
+
+        # Two runs is exactly one short of the minimum, the case most likely to tempt a lazy implementation into a verdict.
         a = self.run_set(60, 2)
         v = stats.compare(a, a)
         self.assertEqual(v[0], stats.NOT_ENOUGH)
@@ -194,6 +213,8 @@ class ReportTests(Tmp):
 
     def test_report_improved_and_saved(self):
         """A clear gain gives IMPROVED and the report is saved under GAMETUNE_HOME."""
+
+        # 60 vs 90 FPS is a 50% gain, far outside the roughly 1 FPS spread between runs, so the verdict must be IMPROVED.
         b = self.make("b", (60, 61, 59))
         t = self.make("t", (90, 91, 89))
         # warmup_s=2 keeps the 20 s synthetic runs long enough after trimming.
@@ -204,6 +225,8 @@ class ReportTests(Tmp):
 
     def test_two_runs_not_enough(self):
         """Fewer than 3 runs per side must not produce a verdict."""
+
+        # Only two logs per side; the report must refuse to claim anything.
         b = self.make("b", (60, 61))
         t = self.make("t", (90, 91))
         self.assertEqual(report.build(b, t, warmup_s=2)["verdict"], "NOT ENOUGH DATA")
@@ -219,6 +242,8 @@ class ReportTests(Tmp):
 
     def test_hot_warning(self):
         """Logs showing an 88 C GPU make the report carry a thermal warning."""
+
+        # 88 C is above the 86 C threshold in report.build, which proves the warning is driven by the log's own temperature column.
         b = [self.write("b%d.csv" % i, log_text(steady(60, 20), gpu_temp=88)) for i in range(3)]
         t = self.make("t", (60, 60, 60))
         self.assertTrue(report.build(b, t, warmup_s=2)["warnings"])
@@ -234,6 +259,8 @@ class ThermalTests(unittest.TestCase):
         self.assertEqual(E(85, 70, True)[0], thermal.TOO_HOT_TO_START)
         # 85 C is too hot to START heavy work but fine for work already running.
         self.assertEqual(E(85, 70, False)[0], thermal.OK)
+
+        # Boundaries: 86 pauses, 91 aborts. Pinning exact limits stops accidental loosening of a safety margin.
         self.assertEqual(E(86, 70, False)[0], thermal.PAUSE)
         self.assertEqual(E(91, 70, False)[0], thermal.ABORT)
         self.assertEqual(E(60, 94, False)[0], thermal.PAUSE)
@@ -245,6 +272,7 @@ class ThermalTests(unittest.TestCase):
     def test_limits_only_stricter(self):
         """Looser limits are clamped to defaults; stricter ones are honoured."""
         # Callers asking for laxer limits than the defaults must be ignored.
+        # 99 and 120 are deliberately absurd to prove clamping, not tuned values.
         lim = thermal.Limits(gpu_start=99, gpu_pause=99, gpu_abort=99, cpu_abort=120)
         self.assertEqual((lim.gpu_start, lim.gpu_pause, lim.gpu_abort, lim.cpu_abort), (84, 86, 91, 96))
         self.assertEqual(thermal.evaluate(80, 50, True, thermal.Limits(gpu_start=70))[0], thermal.TOO_HOT_TO_START)
@@ -256,6 +284,7 @@ class ThermalTests(unittest.TestCase):
     def test_selftest_refuses_hot(self):
         """A hot GPU stops the self-test before it starts anything."""
         # Pretend every tool is installed so only the thermal check can stop the run.
+        # Fake "installed" paths so selftest gets past the missing-tool check; no process is ever started because the thermal guard refuses first.
         which = lambda n: "/bin/" + n
         r = selftest.run(which=which, sample=lambda: {"gpu_c": 88.0, "cpu_c": 50.0}, mangohud_path=None)
         self.assertEqual(r["status"], "REFUSED_HOT")
@@ -263,6 +292,7 @@ class ThermalTests(unittest.TestCase):
     def test_selftest_skips_when_missing(self):
         """Missing tools give a SKIPPED (not FAILED) result with install advice."""
         # Pretend no tool is installed.
+        # which always returns None -> every tool missing, which must be SKIPPED (exit 2) rather than FAILED (exit 1).
         r = selftest.run(which=lambda n: None, sample=lambda: {"gpu_c": 50.0, "cpu_c": 50.0})
         self.assertEqual(r["status"], "SKIPPED")
         text = " ".join(r["lines"])
@@ -274,6 +304,7 @@ class ThermalTests(unittest.TestCase):
         """The CPU reading prefers the "Package id 0" sensor (71 C) over a hotter core (80 C)."""
         with tempfile.TemporaryDirectory() as root:
             # Build a fake hwmon node shaped like an Intel coretemp driver.
+            # Same layout as /sys/class/hwmon on Intel: a "name" file plus tempN_input (millidegrees) and tempN_label files.
             hw = os.path.join(root, "sys/class/hwmon/hwmon0")
             os.makedirs(hw)
             open(os.path.join(hw, "name"), "w").write("coretemp\n")
@@ -303,6 +334,8 @@ class HardwareTests(unittest.TestCase):
         if hybrid:
             w("sys/devices/cpu_core/cpus", "0-1")
             w("sys/devices/cpu_atom/cpus", "2-3")
+
+        # Vendor ids mirror real sysfs values: 0x1002 AMD, 0x8086 Intel.
         w("sys/class/drm/card0/device/vendor", "0x1002\n")
         w("sys/class/drm/card0/device/device", "0x73bf\n")
         # 8 GiB in bytes, the unit sysfs uses.
@@ -313,6 +346,7 @@ class HardwareTests(unittest.TestCase):
     def test_fake_tree(self):
         """A full scan of the fake tree reports every field correctly."""
         # Canned `lspci -mm -nn` output so no real lspci is run.
+        # Second card is listed first in lspci on purpose; names are matched by PCI id, not by order.
         lspci = '00:02.0 "VGA compatible controller [0300]" "Intel Corporation [8086]" "Fake iGPU [46a6]" -r0c\n' \
                 '03:00.0 "VGA compatible controller [0300]" "AMD [1002]" "Fake Radeon [73bf]" -r0c\n'
         with tempfile.TemporaryDirectory() as root:
@@ -321,6 +355,8 @@ class HardwareTests(unittest.TestCase):
                                  environ={"XDG_SESSION_TYPE": "Wayland"}, which=lambda n: "/x/" + n if n == "gamescope" else None)
         self.assertEqual(info["cpu"]["model"], "Fake CPU 9000")
         self.assertEqual(info["cpu"]["logical_cpus"], 4)
+
+        # 4 threads with core_id 0,0,1,1 -> 2 physical cores, proving SMT siblings are not double-counted.
         self.assertEqual(info["cpu"]["physical_cores"], 2)
         self.assertTrue(info["cpu"]["hybrid"])
         self.assertEqual((info["cpu"]["performance_cpus"], info["cpu"]["efficiency_cpus"]), ("0-1", "2-3"))
@@ -343,6 +379,7 @@ class HardwareTests(unittest.TestCase):
     def test_nvidia_smi_overrides(self):
         """nvidia-smi output supplies name and VRAM even with no sysfs data."""
         # Canned nvidia-smi CSV: name, memory in MiB, driver version.
+        # Root is a nonexistent path so sysfs finds nothing; the GPU can only come from nvidia-smi, which isolates that code path.
         smi = "Fake RTX, 6144, 999.1\n"
         gpus = hardware.detect_gpus(root="/nonexistent", runner=lambda a: smi if a[0] == "nvidia-smi" else None)
         self.assertEqual((gpus[0]["vendor"], gpus[0]["vram_mib"], gpus[0]["kind"]), ("NVIDIA", 6144, "discrete"))
@@ -351,6 +388,8 @@ class HardwareTests(unittest.TestCase):
         """CPU-list parse/format round trip and bad-input handling."""
         self.assertEqual(hardware.parse_cpulist("0-2,5"), [0, 1, 2, 5])
         self.assertEqual(hardware.format_cpulist([0, 1, 2, 5]), "0-2,5")
+
+        # Bad input must give an empty list rather than a partial one, since a partial list could pin a game to the wrong cores.
         self.assertEqual(hardware.parse_cpulist("junk"), [])
 
     def test_empty_root_does_not_crash(self):
@@ -375,6 +414,7 @@ class ProfileTests(Tmp):
     def test_dry_run_writes_nothing(self):
         """plan() is pure: the disk, including the data folder, is untouched."""
         # Snapshot first so we can prove nothing changed.
+        # Whole-tree snapshot is the strongest check that "dry run" really writes nothing, including no empty folders.
         before = self.tree()
         pl = profiles.plan("mygame", add=("fps-cap", {"fps": "60"}))
         self.assertTrue(pl["files"])
@@ -400,6 +440,7 @@ class ProfileTests(Tmp):
     def test_apply_revert_round_trip_restores_bytes(self):
         """After two applies, revert restores a pre-existing file byte-for-byte (including non-UTF-8 bytes)."""
         # Pre-create a file gametune would overwrite, with bytes that are not valid UTF-8, to prove exact restoration.
+        # Non-UTF-8 bytes (\xff\x00) prove the journal stores raw bytes (base64) rather than text that could be altered by decoding.
         launch = paths.sub("launch", "g2.launch.txt")
         os.makedirs(os.path.dirname(launch))
         with open(launch, "wb") as f:
@@ -419,6 +460,8 @@ class ProfileTests(Tmp):
     def test_revert_single_profile_rebuilds(self):
         """Removing one of two profiles rebuilds the launch line; removing the last leaves no files."""
         for name, params in (("fps-cap", {"fps": "75"}), ("shader-cache", {})):
+
+            # shader-cache needs a vendor to choose between NVIDIA and Mesa variables, hence the hw dict.
             profiles.apply_plan("g3", profiles.plan("g3", add=(name, params), hw={"gpu_vendor": "NVIDIA"}), "a")
         # Reverting one of two profiles must rebuild the launch line from what remains.
         ok, _ = profiles.revert_profile("g3", "fps-cap")
@@ -436,6 +479,8 @@ class ProfileTests(Tmp):
         with open(paths.sub("launch", "g4.launch.txt"), "a") as f:
             # Simulate the user hand-editing the file gametune wrote.
             f.write("edited")
+
+        # Refusal must come with an actionable message mentioning --force, so the user knows how to override on purpose.
         ok, msg = profiles.revert_game("g4")
         self.assertFalse(ok)
         self.assertIn("--force", msg)
@@ -462,6 +507,8 @@ class ProfileTests(Tmp):
 
     def test_bad_names_and_params(self):
         """Path-like game names and out-of-range or non-numeric options raise ProfileError."""
+
+        # Each of these would escape the data folder or confuse a shell: traversal, subdirectory, empty, leading dash, space.
         for bad in ("../x", "a/b", "", "-x", "a b"):
             with self.assertRaises(profiles.ProfileError):
                 profiles.check_game(bad)
@@ -478,6 +525,8 @@ class ProfileTests(Tmp):
         for f in os.listdir(os.path.join(src, "gametune")):
             if f.endswith(".py"):
                 blob += open(os.path.join(src, "gametune", f)).read()
+
+        # Static check on source text: offline operation and "never kills programs" are promises of the project, so a banned import fails the build.
         for word in ("import socket", "urllib", "http.client", "requests", "pkill", "killall", '"sudo"'):
             self.assertNotIn(word, blob, word)
 
