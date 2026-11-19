@@ -132,7 +132,16 @@ def parse_file(path):
 
 
 def drop_warmup(log, warmup_s):
-    """Return (frametimes, gpu_temps) after throwing away the first warmup_s seconds of the log."""
+    """Return the frametimes (ms) left after throwing away the first warmup_s seconds of the log.
+
+    Args:
+        log: A parsed MangoHud log (needs .times_s and .frametimes_ms, parallel lists).
+        warmup_s: Seconds of warm-up to discard, measured from the first row's timestamp.
+
+    Returns:
+        A single list of frametimes in milliseconds (NOT a tuple; GPU temperatures are not
+        returned by this function). Empty if the log is shorter than warmup_s.
+    """
     if warmup_s <= 0:
         return list(log.frametimes_ms)
     start = log.times_s[0] if log.times_s else 0.0

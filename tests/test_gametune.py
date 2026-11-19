@@ -115,6 +115,17 @@ class ParserTests(Tmp):
         self.assertAlmostEqual(sum(kept) / 1000.0, 5.0, delta=0.2)
         self.assertEqual(mangohud.drop_warmup(log, 50.0), [])
 
+    def test_drop_warmup_returns_one_plain_list(self):
+        """drop_warmup returns a single list of frametimes, never a (frametimes, temps) tuple.
+
+        The docstring used to promise a tuple; callers (cli/report) index the result as a list.
+        This pins the real contract, including the warmup_s <= 0 branch.
+        """
+        log = mangohud.parse_text(log_text([100.0] * 100))
+        for warmup in (0, 5.0, 50.0):
+            self.assertIsInstance(mangohud.drop_warmup(log, warmup), list)
+        self.assertEqual(len(mangohud.drop_warmup(log, 0)), 100)
+
 
 class StatsTests(unittest.TestCase):
     """Metric definitions and the noise-aware verdict rules."""
