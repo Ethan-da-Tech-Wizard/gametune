@@ -15,6 +15,12 @@ Layout (MangoHud 0.6 to 0.8):
 Older logs have no system header and start at the column-name line. Extra or missing columns are fine;
 only `frametime` (or `fps`) is required. Summary files (*_summary.csv) are not frame logs and are refused.
 """
+
+# File role: reads the CSV frame logs MangoHud writes. report.py (via load_side) and selftest.py are the only callers; profiles.py never parses logs.
+# It converts raw text into a FrameLog of plain lists so stats.py needs no knowledge of the CSV format.
+# Design decision: be tolerant of truncated or slightly different logs (games crash, MangoHud versions differ) but never invent data:
+# bad rows are counted in skipped_rows and a file with no usable frames raises LogError. Known limit: only frametime/fps/elapsed/temps are read.
+
 import os
 
 
@@ -22,6 +28,7 @@ class LogError(ValueError):
     """The file is not a usable MangoHud frame log (message is a plain sentence)."""
 
 
+# Parallel lists (index i is the same frame in each) instead of a list of row objects, which is cheaper and what stats.py consumes.
 class FrameLog(object):
     """Parsed contents of one MangoHud frame log (plain data holder)."""
     def __init__(self, path, header, frametimes_ms, times_s, gpu_temps, cpu_temps, skipped_rows):
@@ -34,6 +41,7 @@ class FrameLog(object):
         self.skipped_rows = skipped_rows
 
 
+# None (not 0.0) marks an unparsable cell so a missing value cannot be mistaken for a real zero.
 def _floats(fields):
     """Convert strings to floats, using None for any field that is not a number."""
     out = []
@@ -53,12 +61,15 @@ def parse_text(text, path="<text>"):
     """
     # Blank lines are discarded so row positions are stable.
     # Blank lines are discarded so row positions are stable.
+    # Keeping only non-blank lines means the header-position arithmetic below does not depend on stray empty lines.
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
         raise LogError("The log file is empty.")
     # Locate the column-name line. It is line 1 for old logs or line 3 when a
     # two-line system header precedes it, so scan the first few lines.
     col_idx = None
+
+    # Only the first six lines are searched: the column line is within the first three, and searching the whole file could misread a data row.
     for i, ln in enumerate(lines[:6]):
         cols = [c.strip().lower() for c in ln.split(",")]
         if "frametime" in cols or ("fps" in cols and len(cols) > 1):
@@ -69,15 +80,19 @@ def parse_text(text, path="<text>"):
     # Re-split the chosen line; names are lower-cased so matching ignores case.
     cols = [c.strip().lower() for c in lines[col_idx].split(",")]
     # Summary CSVs start with a header row like "os,cpu,gpu,..." and have no frame data.
+    # Summary files share the "os,cpu,gpu" header shape, which is how they are told apart from the system header of a real log.
     if "os" in cols and "cpu" in cols and "frametime" not in cols:
         raise LogError("This looks like a summary file, not a frame log.")
     # System header (os/cpu/gpu/driver/kernel) sits in the two lines before the columns; used later to detect unfair comparisons.
     header = {}
+
+    # Old MangoHud logs have no system header, so the dict stays empty and later fairness checks are simply skipped.
     if col_idx >= 2:
         names = [c.strip() for c in lines[col_idx - 2].split(",")]
         values = [c.strip() for c in lines[col_idx - 1].split(",")]
         header = dict(zip(names, values))
     # Column positions are looked up by name because MangoHud versions differ in column order and count.
+    # Index or None for every optional column so the row loop can test "is this column present" with a single comparison.
     ft_i = cols.index("frametime") if "frametime" in cols else None
     fps_i = cols.index("fps") if "fps" in cols else None
     el_i = cols.index("elapsed") if "elapsed" in cols else None
@@ -88,11 +103,15 @@ def parse_text(text, path="<text>"):
     # Count of rows rejected (short, non-numeric or non-positive frame time).
     skipped = 0
     cumulative = 0.0
+
+    # Data rows start right after the column line; the loop never looks at the header lines again.
     for ln in lines[col_idx + 1:]:
         fields = ln.split(",")
         if len(fields) < len(cols):          # a short (cut-off) row, e.g. the log was killed mid-write
             skipped += 1
             continue
+
+        # Convert the whole row once; the optional columns are then picked out by index.
         vals = _floats(fields)
         ft = vals[ft_i] if ft_i is not None else None
         # Fallback for logs without a frametime column: derive it from instantaneous FPS.
@@ -103,6 +122,7 @@ def parse_text(text, path="<text>"):
             skipped += 1
             continue
         # Running clock in seconds, used when there is no usable elapsed column.
+        # Needed as a clock fallback and updated for every accepted row, so skipped rows do not create time gaps.
         cumulative += ft / 1000.0
         # `elapsed` is in nanoseconds; if absent, the running sum of frame times is used as the clock.
         t = vals[el_i] / 1e9 if el_i is not None and vals[el_i] is not None else cumulative
@@ -120,6 +140,8 @@ def parse_text(text, path="<text>"):
 
 def parse_file(path):
     """Read a MangoHud CSV from disk and parse it. Raises LogError on any problem."""
+
+    # Checked on the file name first to give a precise message before trying to parse a file of the wrong kind.
     if os.path.basename(path).lower().endswith("_summary.csv"):
         raise LogError("%s is a MangoHud summary file, not a frame log." % os.path.basename(path))
     try:
@@ -142,9 +164,13 @@ def drop_warmup(log, warmup_s):
         A single list of frametimes in milliseconds (NOT a tuple; GPU temperatures are not
         returned by this function). Empty if the log is shorter than warmup_s.
     """
+
+    # A copy is returned (not the log's own list) so callers can never mutate the parsed log.
     if warmup_s <= 0:
         return list(log.frametimes_ms)
     start = log.times_s[0] if log.times_s else 0.0
+
+    # `for ... else` below: the else branch runs only if the loop never found a row past the warm-up, which means the whole log is warm-up.
     cut = 0
     # elapsed is measured from when logging began, so use time relative to the first row
     for i, t in enumerate(log.times_s):
