@@ -23,6 +23,7 @@ class LogError(ValueError):
 
 
 class FrameLog(object):
+    """Parsed contents of one MangoHud frame log (plain data holder)."""
     def __init__(self, path, header, frametimes_ms, times_s, gpu_temps, cpu_temps, skipped_rows):
         self.path = path
         self.header = header            # dict of system header fields (may be empty)
@@ -34,6 +35,7 @@ class FrameLog(object):
 
 
 def _floats(fields):
+    """Convert strings to floats, using None for any field that is not a number."""
     out = []
     for f in fields:
         try:
@@ -44,9 +46,16 @@ def _floats(fields):
 
 
 def parse_text(text, path="<text>"):
+    """Parse MangoHud CSV text into a FrameLog; raise LogError if unusable.
+
+    Rows that are damaged or cut off are counted in `skipped_rows` instead of
+    failing the whole file, because logs are often truncated when a game exits.
+    """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
         raise LogError("The log file is empty.")
+    # Locate the column-name line. It is line 1 for old logs or line 3 when a
+    # two-line system header precedes it, so scan the first few lines.
     col_idx = None
     for i, ln in enumerate(lines[:6]):
         cols = [c.strip().lower() for c in ln.split(",")]
@@ -56,13 +65,16 @@ def parse_text(text, path="<text>"):
     if col_idx is None:
         raise LogError("No MangoHud column line (with 'frametime' or 'fps') was found. This does not look like a MangoHud frame log.")
     cols = [c.strip().lower() for c in lines[col_idx].split(",")]
+    # Summary CSVs start with a header row like "os,cpu,gpu,..." and have no frame data.
     if "os" in cols and "cpu" in cols and "frametime" not in cols:
         raise LogError("This looks like a summary file, not a frame log.")
+    # System header (os/cpu/gpu/driver/kernel) sits in the two lines before the columns; used later to detect unfair comparisons.
     header = {}
     if col_idx >= 2:
         names = [c.strip() for c in lines[col_idx - 2].split(",")]
         values = [c.strip() for c in lines[col_idx - 1].split(",")]
         header = dict(zip(names, values))
+    # Column positions are looked up by name because MangoHud versions differ in column order and count.
     ft_i = cols.index("frametime") if "frametime" in cols else None
     fps_i = cols.index("fps") if "fps" in cols else None
     el_i = cols.index("elapsed") if "elapsed" in cols else None
@@ -78,12 +90,15 @@ def parse_text(text, path="<text>"):
             continue
         vals = _floats(fields)
         ft = vals[ft_i] if ft_i is not None else None
+        # Fallback for logs without a frametime column: derive it from instantaneous FPS.
         if ft is None and fps_i is not None and vals[fps_i]:
             ft = 1000.0 / vals[fps_i] if vals[fps_i] > 0 else None
+        # `ft != ft` is the NaN test; zero, negative or NaN frame times are corrupt.
         if ft is None or ft <= 0 or ft != ft:
             skipped += 1
             continue
         cumulative += ft / 1000.0
+        # `elapsed` is in nanoseconds; if absent, the running sum of frame times is used as the clock.
         t = vals[el_i] / 1e9 if el_i is not None and vals[el_i] is not None else cumulative
         frametimes.append(ft)
         times.append(t)
@@ -97,9 +112,11 @@ def parse_text(text, path="<text>"):
 
 
 def parse_file(path):
+    """Read a MangoHud CSV from disk and parse it. Raises LogError on any problem."""
     if os.path.basename(path).lower().endswith("_summary.csv"):
         raise LogError("%s is a MangoHud summary file, not a frame log." % os.path.basename(path))
     try:
+        # errors="replace" keeps a stray non-UTF-8 byte from killing the parse.
         with open(path, "r", errors="replace") as handle:
             text = handle.read()
     except OSError as exc:

@@ -6,6 +6,7 @@
 # ==============================================================================
 
 """Where gametune keeps its own files. Nothing else on the computer is ever written."""
+# Resolution order: GAMETUNE_HOME (tests) > $XDG_DATA_HOME > ~/.local/share.
 import os
 
 
@@ -19,4 +20,5 @@ def home():
 
 
 def sub(*parts):
+    """Return a path inside the data folder (does not create it)."""
     return os.path.join(home(), *parts)

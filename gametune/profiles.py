@@ -25,10 +25,14 @@ import time
 
 from . import paths, thermal
 
+# Game names become file names under gametune's data folder, so the pattern
+# forbids slashes, leading dots and anything else that could escape that
+# folder (path traversal) or confuse a shell.
 GAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class ProfileError(Exception):
+    """User-facing error: the message is a plain sentence printed by the CLI."""
     pass
 
 
@@ -44,11 +48,19 @@ class Piece(object):
 
 
 def _even(x):
+    """Round to the nearest integer, then down to an even number.
+
+    Scaled resolutions are kept even because some video paths reject odd sizes.
+    """
     x = int(round(x))
     return x - (x % 2)
 
 
 def _render_scale(params, hw):
+    """Builder for "render-scale": gamescope draws small and upscales with FSR 1.
+
+    Validates --output (WxH) and --scale (0.3 to 1.0) before building anything.
+    """
     out = params.get("output", "1920x1080")
     m = re.match(r"^(\d{3,5})x(\d{3,5})$", out)
     if not m:
@@ -61,12 +73,14 @@ def _render_scale(params, hw):
     if not 0.3 <= s <= 1.0:
         raise ProfileError("--scale must be between 0.3 and 1.0.")
     p = Piece()
+    # gamescope flags: -w/-h = game (internal) size, -W/-H = output size, -F fsr = FSR 1 upscaler.
     p.gamescope = ["-w", str(_even(W * s)), "-h", str(_even(H * s)), "-W", str(W), "-H", str(H), "-F", "fsr"]
     p.notes.append("The game draws at %dx%d and gamescope scales it up to %dx%d with FSR 1. Sharpness drops a little." % (_even(W * s), _even(H * s), W, H))
     return p
 
 
 def _fps_cap(params, hw):
+    """Builder for "fps-cap": a MangoHud fps_limit between 20 and 1000."""
     try:
         n = int(params.get("fps", "60"))
     except ValueError:
@@ -80,6 +94,11 @@ def _fps_cap(params, hw):
 
 
 def _measure(params, hw):
+    """Builder for "measure": configure MangoHud to auto-log frame times.
+
+    autostart_log is the delay in seconds before logging begins, log_duration
+    the length, and log_interval=0 means one row per frame (not sampled).
+    """
     p = Piece()
     folder = params.get("log_folder") or paths.sub("logs")
     p.mangohud = ["output_folder=" + folder, "autostart_log=%s" % params.get("delay", "5"),
@@ -89,6 +108,10 @@ def _measure(params, hw):
 
 
 def _shader_cache(params, hw):
+    """Builder for "shader-cache": stop the driver trimming its shader cache.
+
+    Chooses the NVIDIA or Mesa environment variable from the detected GPU vendor.
+    """
     p = Piece()
     vendor = (hw or {}).get("gpu_vendor")
     if vendor == "NVIDIA":
@@ -101,6 +124,7 @@ def _shader_cache(params, hw):
 
 
 def _dxvk_async(params, hw):
+    """Builder for the unproven "dxvk-async" profile (DXVK_ASYNC=1)."""
     p = Piece()
     p.env["DXVK_ASYNC"] = "1"
     p.notes.append("Unproven. It belongs to a patched DXVK and may do nothing on current Proton. Measure before keeping it.")
@@ -108,6 +132,7 @@ def _dxvk_async(params, hw):
 
 
 def _gamemode(params, hw):
+    """Builder for the unproven "gamemode" profile: prefixes the launch with gamemoderun."""
     p = Piece()
     p.prefix = ["gamemoderun"]
     p.notes.append("Unproven. Published gains are small and often inside normal noise. Needs the gamemode package.")
@@ -115,6 +140,10 @@ def _gamemode(params, hw):
 
 
 def _core_pinning(params, hw):
+    """Builder for the unproven "core-pinning" profile: taskset onto performance cores.
+
+    Refuses (ProfileError) when no hybrid CPU was detected, so it never writes a meaningless taskset line.
+    """
     p = Piece()
     perf = (hw or {}).get("performance_cpus")
     if not perf:
@@ -126,11 +155,18 @@ def _core_pinning(params, hw):
 
 
 class Profile(object):
+    """Registry entry describing one profile.
+
+    name/summary are shown to the user; evidence is "established" or "unproven";
+    builder returns a Piece (None for advice-only); kind is "launch", "tool" or
+    "advice"; default_on False hides it unless --experimental; params is help text.
+    """
     def __init__(self, name, summary, evidence, builder, kind="launch", default_on=True, params=""):
         self.name, self.summary, self.evidence, self.builder = name, summary, evidence, builder
         self.kind, self.default_on, self.params = kind, default_on, params
 
 
+# Registry of every profile, keyed by name. The list order is not significant.
 PROFILES = {p.name: p for p in [
     Profile("render-scale", "Draw the game at a lower resolution and scale it up (gamescope + FSR 1). Fewer pixels means less GPU work.",
             "established", _render_scale, params="--scale 0.75 --output 1920x1080"),
@@ -147,12 +183,15 @@ PROFILES = {p.name: p for p in [
     Profile("core-pinning", "Pin the game to the performance cores of a hybrid CPU.", "unproven", _core_pinning, default_on=False),
 ]}
 
+# Ideas deliberately left out, with the reason; shown by `gametune profiles`.
 NOT_OFFERED = [("nice / process priority", "Raising priority needs administrator rights. gametune never uses sudo, so it is not offered.")]
 
+# Process-name prefixes of common memory-hungry programs for the advice-only close-apps profile.
 HEAVY_APPS = ("firefox", "chrome", "chromium", "brave", "vivaldi", "discord", "slack", "teams", "spotify", "obs", "thunderbird", "zoom", "code")
 
 
 def list_profiles(experimental=False):
+    """Profiles to show: default-on ones, plus unproven ones if `experimental`."""
     return [p for p in PROFILES.values() if p.default_on or experimental]
 
 
@@ -164,6 +203,7 @@ def running_heavy_apps(root="/"):
         entries = [e for e in os.listdir(proc) if e.isdigit()]
     except OSError:
         return []
+    # /proc/PID/statm counts pages; assumes the usual 4 KiB page size.
     page_mib = 4096.0 / (1024 * 1024)
     for pid in entries:
         try:
@@ -171,8 +211,10 @@ def running_heavy_apps(root="/"):
                 comm = f.read().strip().lower()
             if not any(h == comm or comm.startswith(h) for h in HEAVY_APPS):
                 continue
+            # Second statm field is resident set size in pages.
             with open(os.path.join(proc, pid, "statm")) as f:
                 rss = int(f.read().split()[1]) * page_mib
+        # Processes can exit mid-scan; just skip any that vanish or have odd contents.
         except (OSError, ValueError, IndexError):
             continue
         found[comm] = found.get(comm, 0.0) + rss
@@ -180,6 +222,7 @@ def running_heavy_apps(root="/"):
 
 
 def check_game(name):
+    """Validate a game name against GAME_RE and return it, or raise ProfileError."""
     if not GAME_RE.match(name or ""):
         raise ProfileError("Game name may only use letters, digits, dot, dash and underscore (max 64), and must start with a letter or digit.")
     return name
@@ -187,7 +230,9 @@ def check_game(name):
 
 def compose(selected, hw):
     """selected: {profile name: params}. Returns (launch_options string, wrapper script text, notes)."""
+    # Accumulators: environment variables, command prefixes, gamescope args, MangoHud options, user notes.
     env, prefix, gs, mh, notes = {}, [], [], [], []
+    # Sorted so the generated line is deterministic regardless of dict order.
     for name in sorted(selected):
         prof = PROFILES[name]
         if prof.builder is None:
@@ -198,6 +243,7 @@ def compose(selected, hw):
         gs += piece.gamescope
         mh += piece.mangohud
         notes += piece.notes
+    # MangoHud takes all options through one MANGOHUD_CONFIG variable.
     if mh:
         env["MANGOHUD_CONFIG"] = ",".join(mh)
     parts = []
@@ -208,7 +254,9 @@ def compose(selected, hw):
         parts += ["gamescope"] + [shlex.quote(x) for x in gs] + ["--"]
     if mh:
         parts.append("mangohud")
+    # %command% is Steam's placeholder for the game's own launch command.
     steam = " ".join(parts + ["%command%"])
+    # Same recipe again as a standalone shell wrapper (for non-Steam use); every value is shlex-quoted.
     wrap_env = ["%s=%s" % (k, shlex.quote(env[k])) for k in sorted(env)]
     wparts = (["env"] + wrap_env if wrap_env else []) + [shlex.quote(x) for x in prefix]
     if gs:
@@ -220,10 +268,12 @@ def compose(selected, hw):
 
 
 def _sha(data):
+    """Hex SHA-256 of bytes; used to detect files edited after gametune wrote them."""
     return hashlib.sha256(data).hexdigest()
 
 
 def _read_bytes(path):
+    """Read a file as bytes, or None if it does not exist or is unreadable."""
     try:
         with open(path, "rb") as f:
             return f.read()
@@ -232,6 +282,7 @@ def _read_bytes(path):
 
 
 def _targets(game):
+    """The four files gametune manages for a game (launch line, wrapper, state, advice)."""
     return {
         "launch": paths.sub("launch", game + ".launch.txt"),
         "wrapper": paths.sub("wrappers", game + ".sh"),
@@ -241,10 +292,12 @@ def _targets(game):
 
 
 def _undo_path(game):
+    """Location of the per-game undo journal."""
     return paths.sub("undo", game + ".json")
 
 
 def _write_atomic(path, data, mode=None):
+    """Write via temp file + os.replace so a crash never leaves a half-written file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
@@ -255,6 +308,7 @@ def _write_atomic(path, data, mode=None):
 
 
 def load_state(game):
+    """Return the saved set of applied profiles for a game (empty if none)."""
     raw = _read_bytes(_targets(game)["state"])
     if raw is None:
         return {"game": game, "profiles": {}}
@@ -265,6 +319,7 @@ def plan(game, add=None, remove=None, hw=None, root="/"):
     """Work out the files that would be written. Pure; writes nothing. Returns dict path -> (bytes, mode) and summary."""
     check_game(game)
     state = load_state(game)
+    # Copy the saved profile set, then apply the requested add/remove to the copy.
     profiles = dict(state.get("profiles", {}))
     if add:
         profiles[add[0]] = add[1]
@@ -273,6 +328,7 @@ def plan(game, add=None, remove=None, hw=None, root="/"):
     t = _targets(game)
     files = {}
     notes = []
+    # With no profiles left, no files are planned; apply_plan then deletes the old ones.
     if profiles:
         steam, wrapper, notes = compose(profiles, hw)
         files[t["launch"]] = (steam.encode("utf-8"), 0o644)
@@ -291,7 +347,9 @@ def apply_plan(game, pl, label):
     """Snapshot every file we are about to touch, then write. Records an undo entry first."""
     t = pl["targets"]
     all_paths = list(t.values())
+    # Load the existing undo journal, or start a new one.
     undo = json.loads(_read_bytes(_undo_path(game)).decode("utf-8")) if _read_bytes(_undo_path(game)) else {"game": game, "records": []}
+    # Snapshot (base64 of the exact bytes, or None for "did not exist") of every managed file before writing.
     snap = {}
     for p in all_paths:
         data = _read_bytes(p)
@@ -315,12 +373,14 @@ def revert_game(game, force=False):
     if raw is None:
         return False, "Nothing to undo for %s." % game
     undo = json.loads(raw.decode("utf-8"))
+    # Safety check: if the user edited a file after our last write, refuse unless --force, so we never destroy their changes.
     last = undo["records"][-1] if undo["records"] else None
     if last and not force:
         for p, digest in last["after_sha256"].items():
             cur = _read_bytes(p)
             if cur is None or _sha(cur) != digest:
                 return False, "%s changed after gametune wrote it. Nothing was restored. Use --force to restore anyway." % p
+    # Restore the state from before the FIRST apply, which undoes every later apply at once.
     first = undo["records"][0]["before"] if undo["records"] else {}
     for p, b64 in first.items():
         if b64 is None:
@@ -333,6 +393,7 @@ def revert_game(game, force=False):
 
 
 def revert_profile(game, name, hw=None, force=False):
+    """Remove one profile; if it was the last, restore everything via revert_game."""
     state = load_state(game)
     if name not in state.get("profiles", {}):
         return False, "Profile %s is not applied to %s." % (name, game)
@@ -344,6 +405,7 @@ def revert_profile(game, name, hw=None, force=False):
 
 
 def all_games():
+    """Names of games that have an undo journal (i.e. that gametune has modified)."""
     try:
         return sorted(f[:-5] for f in os.listdir(paths.sub("undo")) if f.endswith(".json"))
     except OSError:

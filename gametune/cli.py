@@ -12,11 +12,14 @@ import sys
 
 from . import __version__, hardware, paths, profiles, report, selftest, thermal
 
+# Shown whenever a profile adds a launch wrapper/overlay: anti-cheat systems
+# can treat injected overlays as tampering and ban accounts.
 ANTICHEAT = ("Warning: do not use overlays or launch wrappers with games that use anti-cheat unless the publisher says it is allowed. "
              "gametune never touches game files.")
 
 
 def _out(args, data, lines):
+    """Print `data` as JSON when --json is set, otherwise print `lines` as plain text."""
     if args.json:
         print(json.dumps(data, indent=2, default=str))
     else:
@@ -25,14 +28,21 @@ def _out(args, data, lines):
 
 
 def cmd_scan(args):
+    """`gametune scan`: detect hardware and helper tools. Always exits 0."""
     info = hardware.scan()
     _out(args, info, hardware.describe(info))
     return 0
 
 
 def cmd_thermal(args):
+    """`gametune thermal`: read temperatures and report the thermal guard decision.
+
+    Exit status: 0 OK, 2 sensors unreadable (UNKNOWN), 1 any other guard state.
+    """
     s = thermal.sample()
+    # The final True asks for a "heavy work" decision, which uses the strictest limits.
     state, msg = thermal.evaluate(s["gpu_c"], s["cpu_c"], True)
+    # Sensors may be missing; say so instead of printing "None".
     fmt = lambda v: "%.0f C" % v if v is not None else "not readable"
     lines = ["GPU temperature: %s." % fmt(s["gpu_c"]), "CPU temperature: %s." % fmt(s["cpu_c"]),
              "Guard result: %s. %s" % (state, msg),
@@ -42,6 +52,11 @@ def cmd_thermal(args):
 
 
 def cmd_selftest(args):
+    """`gametune selftest`: run a short headless scene to prove measuring works.
+
+    Exit status: 0 OK, 2 skipped (tools missing), 3 refused/aborted for thermal
+    reasons, 1 anything else.
+    """
     r = selftest.run(seconds=args.seconds, scene=args.scene, mangohud_path=args.mangohud_path,
                      allow_unknown_temp=args.allow_unknown_temp)
     _out(args, r, r["lines"] + ["RESULT: %s" % r["status"]])
@@ -49,6 +64,11 @@ def cmd_selftest(args):
 
 
 def cmd_profiles(args):
+    """`gametune profiles`: list profiles with their evidence level.
+
+    "Established" ideas are still unproven for a given PC until `report` says so;
+    experimental ones are hidden unless --experimental is passed.
+    """
     data, lines = [], []
     for p in profiles.list_profiles(args.experimental):
         label = "ESTABLISHED idea, still measure it" if p.evidence == "established" else "UNPROVEN, test it"
@@ -64,15 +84,24 @@ def cmd_profiles(args):
 
 
 def cmd_apply(args):
+    """`gametune apply PROFILE --game NAME`: plan, and with --yes write, a profile.
+
+    Without --yes this is a dry run that only prints what would be written.
+    Returns 0 on success, 1 when the profile is unknown/refused.
+    """
     try:
         if args.profile not in profiles.PROFILES:
             raise profiles.ProfileError("Unknown profile %s. Run: gametune profiles" % args.profile)
         prof = profiles.PROFILES[args.profile]
+        # Unproven profiles need an explicit opt-in so nobody applies them by accident.
         if not prof.default_on and not args.experimental:
             raise profiles.ProfileError("%s is unproven and off by default. Add --experimental if you want to test it." % args.profile)
         info = hardware.scan()
+        # Hardware facts the planner needs to choose vendor-specific options and CPU pinning.
         hw = {"gpu_vendor": hardware.primary_gpu_vendor(info), "performance_cpus": info["cpu"]["performance_cpus"]}
+        # Only pass options the user actually supplied, so profile defaults still apply.
         params = {k: v for k, v in (("scale", args.scale), ("output", args.output), ("fps", args.fps)) if v is not None}
+        # plan() is pure: it computes the file contents without touching the disk.
         pl = profiles.plan(args.game, add=(args.profile, params), hw=hw)
         s = thermal.sample()
         state, msg = thermal.evaluate(s["gpu_c"], s["cpu_c"], False)
@@ -85,6 +114,7 @@ def cmd_apply(args):
         lines += pl["notes"]
         if prof.kind != "advice":
             lines.append(ANTICHEAT)
+        # Only now does anything get written to disk.
         if args.yes:
             profiles.apply_plan(args.game, pl, "apply " + args.profile)
             lines.append("Done. Paste the launch options into the game's Steam Launch Options. Undo with: gametune revert %s --game %s" % (args.profile, args.game))
@@ -98,6 +128,10 @@ def cmd_apply(args):
 
 
 def cmd_revert(args):
+    """`gametune revert`: undo one profile for a game, or everything with --all.
+
+    Returns 0 only if every revert succeeded.
+    """
     if not args.all and not (args.profile and args.game):
         print("Use: gametune revert PROFILE --game NAME   or   gametune revert --all")
         return 1
@@ -119,6 +153,10 @@ def cmd_revert(args):
 
 
 def cmd_report(args):
+    """`gametune report`: compare baseline vs tuned MangoHud logs and save the result.
+
+    Exit status 2 means NOT ENOUGH DATA so scripts can tell "no claim" from success.
+    """
     rep = report.build(report.expand(args.baseline), report.expand(args.tuned), warmup_s=args.warmup, min_runs=args.runs)
     jpath, tpath = report.save(rep)
     if args.json:
@@ -131,9 +169,11 @@ def cmd_report(args):
 
 
 def build_parser():
+    """Build the argparse parser with one sub-command per cmd_* function."""
     ap = argparse.ArgumentParser(prog="gametune", description="Honest game performance helper. Local only. No telemetry. No network.")
     ap.add_argument("--version", action="version", version="gametune " + __version__)
     sub = ap.add_subparsers(dest="cmd")
+    # Helper: register a sub-command, give it --json, and bind its handler via set_defaults(fn=...).
     def add(name, fn, help_):
         p = sub.add_parser(name, help=help_)
         p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -166,8 +206,10 @@ def build_parser():
 
 
 def main(argv=None):
+    """Entry point. Returns a process exit code (0 when only help is printed)."""
     ap = build_parser()
     args = ap.parse_args(argv)
+    # No sub-command given: show help rather than erroring.
     if not getattr(args, "fn", None):
         ap.print_help()
         return 0

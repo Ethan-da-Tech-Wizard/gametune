@@ -1,32 +1,45 @@
+# ==============================================================================
+# File: test_gametune.py
+# Purpose: Offline unit tests for gametune. They use fake /proc and /sys trees,
+# synthetic MangoHud logs and injected command runners, so no real hardware,
+# GPU tools or network are needed. Run with tests/run_tests.py.
+# ==============================================================================
 import os
 import sys
 import tempfile
 import unittest
 
+# Make the repo root importable so `import gametune` works without installing.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gametune import hardware, mangohud, paths, profiles, report, selftest, stats, thermal  # noqa: E402
 
+# Fixture: the two-line system header MangoHud writes at the top of a log.
 HEADER = "os,cpu,gpu,ram,kernel,driver,cpuscheduler\nLinux,TestCPU,TestGPU,16000,6.1,drv1,powersave\n"
+# Fixture: the column-name line; `elapsed` is in nanoseconds.
 COLS = "fps,frametime,cpu_load,gpu_temp,cpu_temp,elapsed\n"
 
 
 def log_text(frametimes, gpu_temp=60, header=True, cols=COLS):
+    """Build MangoHud-format CSV text from a list of frame times in milliseconds."""
     t = 0.0
     rows = []
     for ft in frametimes:
+        # ms -> ns, matching MangoHud's `elapsed` column.
         t += ft * 1e6
         rows.append("%.2f,%.4f,10,%s,50,%d" % (1000.0 / ft, ft, gpu_temp, t))
     return (HEADER if header else "") + cols + "\n".join(rows) + "\n"
 
 
 def steady(fps, seconds=30, jitter=0.0):
+    """Frame times for a steady `fps` run; jitter alternates +/- that fraction to add noise."""
     n = int(fps * seconds)
     base = 1000.0 / fps
     return [base * (1 + jitter * (1 if i % 2 else -1)) for i in range(n)]
 
 
 class Tmp(unittest.TestCase):
+    """Base class: gives each test a temp dir and points GAMETUNE_HOME inside it so nothing real is touched."""
     def setUp(self):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
@@ -36,6 +49,7 @@ class Tmp(unittest.TestCase):
         self.addCleanup(lambda: os.environ.__setitem__("GAMETUNE_HOME", old) if old else os.environ.pop("GAMETUNE_HOME", None))
 
     def write(self, name, text):
+        """Write a file in the temp dir and return its path."""
         p = os.path.join(self.dir, name)
         with open(p, "w") as f:
             f.write(text)
@@ -43,42 +57,51 @@ class Tmp(unittest.TestCase):
 
 
 class ParserTests(Tmp):
+    """MangoHud log parsing: header variants, missing columns, damaged input."""
     def test_full_log(self):
+        """A complete log parses; header fields and elapsed time are read."""
         log = mangohud.parse_text(log_text([16.0] * 10))
         self.assertEqual(len(log.frametimes_ms), 10)
         self.assertEqual(log.header["gpu"], "TestGPU")
         self.assertAlmostEqual(log.times_s[-1], 0.16, places=3)
 
     def test_no_system_header(self):
+        """Older logs without the system header still parse, with an empty header dict."""
         log = mangohud.parse_text(log_text([20.0] * 5, header=False))
         self.assertEqual(len(log.frametimes_ms), 5)
         self.assertEqual(log.header, {})
 
     def test_missing_columns_fps_only(self):
+        """With no frametime column, frame times are derived from fps (1000/fps)."""
         log = mangohud.parse_text("fps,gpu_temp\n50,60\n100,61\n")
         self.assertEqual([round(x) for x in log.frametimes_ms], [20, 10])
 
     def test_no_elapsed_uses_cumulative(self):
+        """Without an elapsed column the clock is the running sum of frame times."""
         log = mangohud.parse_text("frametime\n10\n10\n10\n")
         self.assertAlmostEqual(log.times_s[-1], 0.03, places=6)
 
     def test_truncated_last_row_skipped(self):
+        """A cut-off final row is counted as skipped, not fatal."""
         text = log_text([16.0] * 4) + "60.0,16.0,1\n"
         log = mangohud.parse_text(text)
         self.assertEqual(len(log.frametimes_ms), 4)
         self.assertEqual(log.skipped_rows, 1)
 
     def test_garbage_and_empty(self):
+        """Empty, non-CSV, and header-only inputs raise LogError."""
         for bad in ("", "hello\nworld\n", COLS):
             with self.assertRaises(mangohud.LogError):
                 mangohud.parse_text(bad)
 
     def test_summary_file_refused(self):
+        """*_summary.csv files are rejected because they hold no frame data."""
         p = self.write("run_summary.csv", "0.1% Percentile,1% Percentile\n1,2\n")
         with self.assertRaises(mangohud.LogError):
             mangohud.parse_file(p)
 
     def test_warmup_dropped(self):
+        """drop_warmup removes the first N seconds, and everything if N exceeds the run."""
         log = mangohud.parse_text(log_text([100.0] * 100))   # 10 s at 100 ms
         kept = mangohud.drop_warmup(log, 5.0)
         self.assertAlmostEqual(sum(kept) / 1000.0, 5.0, delta=0.2)
@@ -86,7 +109,9 @@ class ParserTests(Tmp):
 
 
 class StatsTests(unittest.TestCase):
+    """Metric definitions and the noise-aware verdict rules."""
     def test_metrics(self):
+        """Median FPS, 1% low (worst single frame of 100) and average FPS match hand calculation."""
         ft = [10.0] * 98 + [50.0, 100.0]
         m = stats.run_metrics(ft)
         self.assertAlmostEqual(m["median_fps"], 100.0)
@@ -94,47 +119,57 @@ class StatsTests(unittest.TestCase):
         self.assertAlmostEqual(m["avg_fps"], 100.0 / (sum(ft) / 1000.0) / 1.0 * 1.0, places=6)
 
     def run_set(self, fps, n, jitter=0.0, shift=0.0):
+        """Helper: n synthetic run-metric dicts around `fps`."""
         return [stats.run_metrics(steady(fps + shift * i, 20, jitter)) for i in range(n)]
 
     def test_identical_is_no_change(self):
+        """Comparing a set of runs with itself must never report a change."""
         a = self.run_set(60, 3)
         self.assertEqual(stats.compare(a, list(a))[0], stats.NO_CHANGE)
 
     def test_clear_improvement(self):
+        """A ~33% FPS gain well beyond the noise is IMPROVED."""
         base = [stats.run_metrics(steady(f, 20, 0.1)) for f in (60, 61, 59)]
         tuned = [stats.run_metrics(steady(f, 20, 0.1)) for f in (80, 81, 79)]
         self.assertEqual(stats.compare(base, tuned)[0], stats.IMPROVED)
 
     def test_clear_worse(self):
+        """A large FPS drop is reported as WORSE."""
         base = [stats.run_metrics(steady(f, 20)) for f in (80, 81, 79)]
         tuned = [stats.run_metrics(steady(f, 20)) for f in (60, 61, 59)]
         self.assertEqual(stats.compare(base, tuned)[0], stats.WORSE)
 
     def test_noisy_small_difference_is_no_change(self):
+        """A +2 FPS shift buried in +/-10 FPS run-to-run spread must not count as a win."""
         base = [stats.run_metrics(steady(f, 20)) for f in (50, 70, 60)]
         tuned = [stats.run_metrics(steady(f, 20)) for f in (52, 72, 62)]
         self.assertEqual(stats.compare(base, tuned)[0], stats.NO_CHANGE)
 
     def test_too_few_runs(self):
+        """Two runs per side give NOT ENOUGH DATA, and the 3-run minimum cannot be lowered by the caller."""
         a = self.run_set(60, 2)
         v = stats.compare(a, a)
         self.assertEqual(v[0], stats.NOT_ENOUGH)
         self.assertEqual(stats.compare(a, a, min_runs=1)[0], stats.NOT_ENOUGH)   # minimum is 3, cannot be lowered
 
     def test_under_one_percent_ignored(self):
+        """A perfectly consistent 0.5% change is below the practical floor, so no change."""
         base = [stats.run_metrics(steady(f, 20)) for f in (60.0, 60.0, 60.0)]
         tuned = [stats.run_metrics(steady(f, 20)) for f in (60.3, 60.3, 60.3)]
         self.assertEqual(stats.compare(base, tuned)[0], stats.NO_CHANGE)
 
 
 class ReportTests(Tmp):
+    """End-to-end report building from log files on disk."""
     def make(self, prefix, fps_list, seconds=20):
+        """Helper: write one synthetic log per entry of fps_list and return the paths."""
         out = []
         for i, f in enumerate(fps_list):
             out.append(self.write("%s%d.csv" % (prefix, i), log_text(steady(f, seconds))))
         return out
 
     def test_report_improved_and_saved(self):
+        """A clear gain gives IMPROVED and the report is saved under GAMETUNE_HOME."""
         b = self.make("b", (60, 61, 59))
         t = self.make("t", (90, 91, 89))
         rep = report.build(b, t, warmup_s=2)
@@ -143,11 +178,13 @@ class ReportTests(Tmp):
         self.assertTrue(j.startswith(os.environ["GAMETUNE_HOME"]) and os.path.isfile(txt))
 
     def test_two_runs_not_enough(self):
+        """Fewer than 3 runs per side must not produce a verdict."""
         b = self.make("b", (60, 61))
         t = self.make("t", (90, 91))
         self.assertEqual(report.build(b, t, warmup_s=2)["verdict"], "NOT ENOUGH DATA")
 
     def test_short_runs_excluded(self):
+        """Runs too short after warm-up are dropped with a note, leaving too little data."""
         b = self.make("b", (60, 61, 59), seconds=4)
         t = self.make("t", (90, 91, 89), seconds=4)
         rep = report.build(b, t, warmup_s=2)
@@ -155,13 +192,16 @@ class ReportTests(Tmp):
         self.assertTrue(rep["notes"])
 
     def test_hot_warning(self):
+        """Logs showing an 88 C GPU make the report carry a thermal warning."""
         b = [self.write("b%d.csv" % i, log_text(steady(60, 20), gpu_temp=88)) for i in range(3)]
         t = self.make("t", (60, 60, 60))
         self.assertTrue(report.build(b, t, warmup_s=2)["warnings"])
 
 
 class ThermalTests(unittest.TestCase):
+    """Thermal guard thresholds, limit tightening, selftest gating and sensor reading."""
     def test_thresholds(self):
+        """Boundary values for OK / TOO_HOT_TO_START / PAUSE / ABORT / UNKNOWN on both GPU and CPU."""
         E = thermal.evaluate
         self.assertEqual(E(84, 70, True)[0], thermal.OK)
         self.assertEqual(E(85, 70, True)[0], thermal.TOO_HOT_TO_START)
@@ -174,19 +214,23 @@ class ThermalTests(unittest.TestCase):
         self.assertEqual(E(70, None, True)[0], thermal.OK)
 
     def test_limits_only_stricter(self):
+        """Looser limits are clamped to defaults; stricter ones are honoured."""
         lim = thermal.Limits(gpu_start=99, gpu_pause=99, gpu_abort=99, cpu_abort=120)
         self.assertEqual((lim.gpu_start, lim.gpu_pause, lim.gpu_abort, lim.cpu_abort), (84, 86, 91, 96))
         self.assertEqual(thermal.evaluate(80, 50, True, thermal.Limits(gpu_start=70))[0], thermal.TOO_HOT_TO_START)
 
     def test_never_97(self):
+        """97 C on the CPU always aborts, the hard safety ceiling."""
         self.assertEqual(thermal.evaluate(50, 97, False)[0], thermal.ABORT)
 
     def test_selftest_refuses_hot(self):
+        """A hot GPU stops the self-test before it starts anything."""
         which = lambda n: "/bin/" + n
         r = selftest.run(which=which, sample=lambda: {"gpu_c": 88.0, "cpu_c": 50.0}, mangohud_path=None)
         self.assertEqual(r["status"], "REFUSED_HOT")
 
     def test_selftest_skips_when_missing(self):
+        """Missing tools give a SKIPPED (not FAILED) result with install advice."""
         r = selftest.run(which=lambda n: None, sample=lambda: {"gpu_c": 50.0, "cpu_c": 50.0})
         self.assertEqual(r["status"], "SKIPPED")
         text = " ".join(r["lines"])
@@ -195,6 +239,7 @@ class ThermalTests(unittest.TestCase):
         self.assertIn("mangohud", r["missing"])
 
     def test_sensor_reading_fake_tree(self):
+        """The CPU reading prefers the "Package id 0" sensor (71 C) over a hotter core (80 C)."""
         with tempfile.TemporaryDirectory() as root:
             hw = os.path.join(root, "sys/class/hwmon/hwmon0")
             os.makedirs(hw)
@@ -207,7 +252,9 @@ class ThermalTests(unittest.TestCase):
 
 
 class HardwareTests(unittest.TestCase):
+    """Hardware detection against fake /proc and /sys trees."""
     def build(self, root, hybrid=True):
+        """Create a fake system: 4 threads on 2 cores, 8 GiB RAM, an AMD and an Intel GPU, optionally hybrid CPU layout."""
         def w(rel, text):
             p = os.path.join(root, rel)
             os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -227,6 +274,7 @@ class HardwareTests(unittest.TestCase):
         w("sys/class/drm/card1/device/device", "0x46a6\n")
 
     def test_fake_tree(self):
+        """A full scan of the fake tree reports every field correctly."""
         lspci = '00:02.0 "VGA compatible controller [0300]" "Intel Corporation [8086]" "Fake iGPU [46a6]" -r0c\n' \
                 '03:00.0 "VGA compatible controller [0300]" "AMD [1002]" "Fake Radeon [73bf]" -r0c\n'
         with tempfile.TemporaryDirectory() as root:
@@ -249,21 +297,25 @@ class HardwareTests(unittest.TestCase):
         self.assertEqual(hardware.primary_gpu_vendor(info), "AMD")
 
     def test_non_hybrid(self):
+        """Without cpu_core/cpu_atom nodes the CPU is not flagged hybrid."""
         with tempfile.TemporaryDirectory() as root:
             self.build(root, hybrid=False)
             self.assertFalse(hardware.detect_cpu(root)["hybrid"])
 
     def test_nvidia_smi_overrides(self):
+        """nvidia-smi output supplies name and VRAM even with no sysfs data."""
         smi = "Fake RTX, 6144, 999.1\n"
         gpus = hardware.detect_gpus(root="/nonexistent", runner=lambda a: smi if a[0] == "nvidia-smi" else None)
         self.assertEqual((gpus[0]["vendor"], gpus[0]["vram_mib"], gpus[0]["kind"]), ("NVIDIA", 6144, "discrete"))
 
     def test_cpulist(self):
+        """CPU-list parse/format round trip and bad-input handling."""
         self.assertEqual(hardware.parse_cpulist("0-2,5"), [0, 1, 2, 5])
         self.assertEqual(hardware.format_cpulist([0, 1, 2, 5]), "0-2,5")
         self.assertEqual(hardware.parse_cpulist("junk"), [])
 
     def test_empty_root_does_not_crash(self):
+        """An empty filesystem yields empty results rather than exceptions."""
         with tempfile.TemporaryDirectory() as root:
             info = hardware.scan(root=root, runner=lambda a: None, environ={}, which=lambda n: None)
             self.assertEqual(info["gpus"], [])
@@ -271,7 +323,9 @@ class HardwareTests(unittest.TestCase):
 
 
 class ProfileTests(Tmp):
+    """Planning, applying and reverting profiles, including all safety guards."""
     def tree(self):
+        """Snapshot of every file (path -> bytes) under the temp dir, for before/after comparisons."""
         out = {}
         for d, _s, fs in os.walk(self.dir):
             for f in fs:
@@ -280,6 +334,7 @@ class ProfileTests(Tmp):
         return out
 
     def test_dry_run_writes_nothing(self):
+        """plan() is pure: the disk, including the data folder, is untouched."""
         before = self.tree()
         pl = profiles.plan("mygame", add=("fps-cap", {"fps": "60"}))
         self.assertTrue(pl["files"])
@@ -287,6 +342,7 @@ class ProfileTests(Tmp):
         self.assertFalse(os.path.exists(paths.home()))
 
     def test_cli_dry_run_and_yes(self):
+        """The CLI writes nothing without --yes, writes with it, and `revert --all` removes it again."""
         from gametune import cli
         import io, contextlib
         buf = io.StringIO()
@@ -302,6 +358,7 @@ class ProfileTests(Tmp):
         self.assertFalse(os.path.exists(paths.sub("launch", "g1.launch.txt")))
 
     def test_apply_revert_round_trip_restores_bytes(self):
+        """After two applies, revert restores a pre-existing file byte-for-byte (including non-UTF-8 bytes)."""
         launch = paths.sub("launch", "g2.launch.txt")
         os.makedirs(os.path.dirname(launch))
         with open(launch, "wb") as f:
@@ -318,6 +375,7 @@ class ProfileTests(Tmp):
         self.assertEqual(self.tree(), before)
 
     def test_revert_single_profile_rebuilds(self):
+        """Removing one of two profiles rebuilds the launch line; removing the last leaves no files."""
         for name, params in (("fps-cap", {"fps": "75"}), ("shader-cache", {})):
             profiles.apply_plan("g3", profiles.plan("g3", add=(name, params), hw={"gpu_vendor": "NVIDIA"}), "a")
         ok, _ = profiles.revert_profile("g3", "fps-cap")
@@ -330,6 +388,7 @@ class ProfileTests(Tmp):
         self.assertEqual(self.tree(), {})
 
     def test_revert_refuses_if_user_edited(self):
+        """A file edited after gametune wrote it is not overwritten unless --force/force=True."""
         profiles.apply_plan("g4", profiles.plan("g4", add=("fps-cap", {})), "a")
         with open(paths.sub("launch", "g4.launch.txt"), "a") as f:
             f.write("edited")
@@ -339,6 +398,7 @@ class ProfileTests(Tmp):
         self.assertTrue(profiles.revert_game("g4", force=True)[0])
 
     def test_unproven_hidden_and_guarded(self):
+        """Unproven profiles are hidden by default and refused without --experimental."""
         names = [p.name for p in profiles.list_profiles()]
         self.assertNotIn("dxvk-async", names)
         self.assertNotIn("core-pinning", names)
@@ -350,12 +410,14 @@ class ProfileTests(Tmp):
         self.assertFalse(os.path.exists(paths.home()))
 
     def test_core_pinning_uses_detected_cores(self):
+        """taskset uses the detected performance cores, and is refused when none are known."""
         pl = profiles.plan("g6", add=("core-pinning", {}), hw={"performance_cpus": "0-3"})
         self.assertIn("taskset -c 0-3", list(pl["files"].values())[0][0].decode())
         with self.assertRaises(profiles.ProfileError):
             profiles.plan("g6", add=("core-pinning", {}), hw={})
 
     def test_bad_names_and_params(self):
+        """Path-like game names and out-of-range or non-numeric options raise ProfileError."""
         for bad in ("../x", "a/b", "", "-x", "a b"):
             with self.assertRaises(profiles.ProfileError):
                 profiles.check_game(bad)
@@ -365,6 +427,7 @@ class ProfileTests(Tmp):
             profiles.plan("g7", add=("render-scale", {"scale": "0.1"}))
 
     def test_no_sudo_or_network_in_source(self):
+        """Guard rail: the package source must not contain network, sudo or process-killing code."""
         src = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         blob = ""
         for f in os.listdir(os.path.join(src, "gametune")):

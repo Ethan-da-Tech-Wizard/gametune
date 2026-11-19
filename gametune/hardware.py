@@ -12,11 +12,14 @@ import shutil
 
 from . import thermal
 
+# External programs gametune can use if present; scan() only reports whether each is on PATH.
 HELPERS = ("mangohud", "gamescope", "gamemoderun", "vkmark", "vkcube")
+# PCI vendor IDs as exposed by sysfs, mapped to display names.
 VENDORS = {"0x10de": "NVIDIA", "0x1002": "AMD", "0x8086": "Intel"}
 
 
 def _read(path):
+    """Return stripped file text, or None when unreadable (missing sysfs nodes are normal)."""
     try:
         with open(path, "r") as handle:
             return handle.read().strip()
@@ -43,6 +46,7 @@ def parse_cpulist(text):
 
 
 def format_cpulist(cpus):
+    """Inverse of parse_cpulist: [0,1,2,5] -> '0-2,5' (the taskset/cpuset syntax)."""
     cpus = sorted(set(cpus))
     parts = []
     start = prev = None
@@ -60,8 +64,13 @@ def format_cpulist(cpus):
 
 
 def detect_cpu(root="/"):
+    """Return CPU model, thread/core counts and hybrid (P/E core) layout.
+
+    `root` is a fake filesystem root so tests can feed fixture trees.
+    """
     info = {"model": None, "logical_cpus": None, "physical_cores": None,
             "hybrid": False, "performance_cpus": None, "efficiency_cpus": None, "hybrid_source": None}
+    # Count "processor" lines for threads; the model-name key differs between x86 ("model name") and ARM ("Hardware"/"Processor").
     text = _read(os.path.join(root, "proc", "cpuinfo")) or ""
     logical = 0
     for line in text.splitlines():
@@ -78,6 +87,7 @@ def detect_cpu(root="/"):
     except OSError:
         pass
     info["logical_cpus"] = logical or (len(cpu_ids) or None)
+    # Physical cores = distinct (package, core_id) pairs, since SMT siblings share a core_id.
     cores = set()
     for cid in cpu_ids:
         core = _read(os.path.join(cpu_dir, "cpu%d" % cid, "topology", "core_id"))
@@ -94,6 +104,7 @@ def detect_cpu(root="/"):
         info.update(hybrid=True, performance_cpus=format_cpulist(p),
                     efficiency_cpus=format_cpulist(e + lp), hybrid_source="sysfs cpu_core/cpu_atom")
     else:
+        # Fallback for non-Intel hybrids (e.g. ARM big.LITTLE): cores with a lower cpu_capacity are the efficiency cores.
         caps = {}
         for cid in cpu_ids:
             raw = _read(os.path.join(cpu_dir, "cpu%d" % cid, "cpu_capacity"))
@@ -109,6 +120,7 @@ def detect_cpu(root="/"):
 
 
 def detect_ram(root="/"):
+    """Total RAM in MiB from /proc/meminfo (MemTotal is reported in kB), or None."""
     text = _read(os.path.join(root, "proc", "meminfo")) or ""
     match = re.search(r"^MemTotal:\s+(\d+)\s*kB", text, re.M)
     total_kib = int(match.group(1)) if match else None
@@ -124,6 +136,7 @@ def _parse_lspci(text):
         parts = re.findall(r'"([^"]*)"', line)
         if len(parts) < 3:
             continue
+        # In `lspci -mm -nn` the vendor and device names each end with a bracketed 4-hex-digit ID.
         ids = re.findall(r"\[([0-9a-f]{4})\]", parts[1] + " " + parts[2])
         if len(ids) < 2:
             continue
@@ -133,6 +146,11 @@ def _parse_lspci(text):
 
 
 def detect_gpus(root="/", runner=thermal.run_text):
+    """List GPUs using sysfs (vendor, VRAM, driver), lspci (names) and nvidia-smi.
+
+    Each entry is a dict; `kind` is "discrete"/"integrated" and marked "(guess)"
+    when inferred rather than reported by the driver.
+    """
     gpus = []
     names = _parse_lspci(runner(["lspci", "-mm", "-nn"]))
     drm = os.path.join(root, "sys", "class", "drm")
@@ -146,12 +164,14 @@ def detect_gpus(root="/", runner=thermal.run_text):
         did = (_read(os.path.join(dev, "device")) or "").lower()
         if not vid:
             continue
+        # mem_info_vram_total (bytes) exists for amdgpu only; other vendors leave VRAM unknown here.
         vram = _read(os.path.join(dev, "mem_info_vram_total"))
         key = (vid[2:] + ":" + did[2:]).lower()
         gpus.append({"card": card, "vendor": VENDORS.get(vid, "Other (" + vid + ")"), "vendor_id": vid,
                      "name": names.get(key), "vram_mib": int(vram) // (1024 * 1024) if vram and vram.isdigit() else None,
                      "driver": os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) if os.path.islink(os.path.join(dev, "driver")) else None,
                      "kind": None})
+    # No DRM cards visible (e.g. container): fall back to whatever lspci listed.
     if not gpus:
         for key, name in names.items():
             vid = "0x" + key.split(":")[0]
@@ -175,6 +195,7 @@ def detect_gpus(root="/", runner=thermal.run_text):
                       "driver": None, "kind": None}
             gpus.append(target)
         target.update(name=name, vram_mib=vram, driver="nvidia " + drv)
+    # Classify. NVIDIA is treated as discrete; AMD with >= 2 GiB VRAM is guessed discrete; Intel is integrated. These are heuristics, hence "(guess)".
     for g in gpus:
         if g["vendor"] == "NVIDIA":
             g["kind"] = "discrete"
@@ -188,6 +209,7 @@ def detect_gpus(root="/", runner=thermal.run_text):
 
 
 def detect_session(environ=None):
+    """Detect X11 vs Wayland from XDG_SESSION_TYPE, falling back to display variables."""
     env = os.environ if environ is None else environ
     stype = env.get("XDG_SESSION_TYPE") or None
     if not stype:
@@ -196,10 +218,16 @@ def detect_session(environ=None):
 
 
 def detect_helpers(which=shutil.which):
+    """Map each helper name to its path on PATH, or None if missing."""
     return {name: which(name) for name in HELPERS}
 
 
 def scan(root="/", runner=thermal.run_text, environ=None, which=shutil.which):
+    """Collect everything gametune knows about this PC into one dict.
+
+    All inputs (fake root, command runner, environment, `which`) are injectable
+    so the whole scan can be tested without real hardware.
+    """
     sample = thermal.sample(root, runner)
     return {
         "cpu": detect_cpu(root),
@@ -212,6 +240,7 @@ def scan(root="/", runner=thermal.run_text, environ=None, which=shutil.which):
 
 
 def primary_gpu_vendor(info):
+    """Vendor of the first discrete GPU, else of the first GPU, else None."""
     gpus = info.get("gpus") or []
     for g in gpus:
         if g.get("kind") == "discrete":
