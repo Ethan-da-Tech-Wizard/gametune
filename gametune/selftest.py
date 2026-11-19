@@ -11,6 +11,13 @@ It runs a tiny Vulkan scene (vkmark, else vkcube) inside `gamescope --backend he
 into a temporary folder, for a short bounded time, then parses the log. It tests the measuring tools. It does
 not show that any game gets faster.
 """
+
+# File role: `gametune selftest` (cli.py cmd_selftest). Proves the measuring chain (gamescope headless + MangoHud logging + mangohud.py parser + stats.py)
+# works on this PC using a tiny Vulkan scene, so a later "NOT ENOUGH DATA" is known to be about the data, not a broken toolchain.
+# Status values and exit codes: OK 0, SKIPPED 2 (tools missing), REFUSED_* / ABORTED_HOT 3 (thermal guard), FAILED 1 (chain broken).
+# Safety design: runs for at most 20 s, is gated by thermal.evaluate before and during the run, and only signals the process group it created.
+# Known limits: needs gamescope, MangoHud and vkcube or vkmark; it measures nothing about any real game.
+
 import glob
 import os
 import shutil
@@ -22,6 +29,7 @@ import time
 from . import hardware, mangohud, stats, thermal
 
 # Only printed as a hint for the user; gametune itself never runs sudo.
+# Arch-specific text because the target machine is an Arch-based Linux box; other distros just see the missing tool names.
 INSTALL_ARCH = "sudo pacman -S --needed mangohud vkmark gamemode"
 # Hard cap on scene length so a self-test can never run for long.
 MAX_SECONDS = 20
@@ -29,6 +37,7 @@ MAX_SECONDS = 20
 
 # Stopping by process group (we start the child with start_new_session) means
 # only processes this test created are signalled, never anything matched by name.
+# Group signalling (killpg) is the safety property: gamescope spawns children, and killing only the leader would leave the scene running.
 def _stop_group(proc):
     """Stop the process group we started (by PID, never by name)."""
     if proc.poll() is not None:
@@ -39,6 +48,7 @@ def _stop_group(proc):
             pass
         return
     # Escalate politely: SIGTERM, wait up to 3 s, then SIGKILL.
+    # Ask nicely first so MangoHud can flush and close its log, and use SIGKILL only if the group ignores the request.
     for sig, wait in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 3.0)):
         try:
             os.killpg(proc.pid, sig)
@@ -54,10 +64,13 @@ def _stop_group(proc):
 def _mangohud_setup(mangohud_path, which):
     """Return (prefix_cmd, extra_env, error). mangohud_path may be a binary or an extracted tree with usr/."""
     # Two accepted forms: an extracted package tree (use its Vulkan implicit layer via env vars) or a mangohud executable.
+    # An explicit path wins over PATH lookup so users can test an unpacked MangoHud without installing it.
     if mangohud_path:
         layer = os.path.join(mangohud_path, "usr", "share", "vulkan", "implicit_layer.d")
         lib = os.path.join(mangohud_path, "usr", "lib", "mangohud", "libMangoHud.so")
         if os.path.isdir(layer) and os.path.isfile(lib):
+
+            # An extracted tree loads through the Vulkan implicit-layer path, so no command prefix is needed (empty list).
             return [], {"MANGOHUD": "1", "VK_ADD_IMPLICIT_LAYER_PATH": layer}, None
         if os.path.isfile(mangohud_path) and os.access(mangohud_path, os.X_OK):
             return [mangohud_path], {}, None
@@ -70,8 +83,10 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
         sample=thermal.sample, limits=None, keep_dir=None):
     """Returns a result dict with status OK / SKIPPED / FAILED / REFUSED_HOT and plain 'lines'."""
     # Clamp to 3..20 s.
+    # Below 3 s there are too few frames to parse; above MAX_SECONDS the run could heat the machine for no extra value.
     seconds = max(3, min(int(seconds), MAX_SECONDS))
     # Result record; `status` is filled in by whichever branch ends the run.
+    # One dict carries everything the CLI needs, including the human-readable lines, so the function itself never prints.
     res = {"status": None, "lines": [], "missing": [], "stats": None, "command": None, "scene": None}
     # Shorthand alias for the human-readable report lines.
     L = res["lines"]
@@ -89,6 +104,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
     # Scene program picked below; stays None if neither vkcube nor vkmark exists.
     chosen = None
     # In auto mode vkcube is tried first (smaller dependency), then vkmark.
+    # An explicit --scene is honoured exactly; "auto" prefers whichever tool is installed.
     order = ["vkcube", "vkmark"] if scene == "auto" else [scene]
     for cand in order:
         if cand in ("vkcube", "vkmark") and which(cand):
@@ -106,9 +122,12 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
     res["scene"] = chosen
 
     # Thermal pre-flight: refuse to start when hot or when temperatures cannot be read (unless explicitly overridden).
+    # `sample` is injectable so tests can simulate hot or unreadable sensors without touching hardware.
     s = sample()
     state, msg = thermal.evaluate(s["gpu_c"], s["cpu_c"], True, limits)
     L.append("Thermal check before start: %s" % msg)
+
+    # Unknown temperatures normally block the run (fail closed); this flag is a deliberate, visible user override.
     if state == thermal.UNKNOWN and allow_unknown_temp:
         state = thermal.OK
         L.append("Continuing because --allow-unknown-temp was given.")
@@ -123,6 +142,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
     own_tmp = keep_dir is None
     try:
         # An empty MangoHud config file stops a user's own config from changing the test.
+        # Pointing MANGOHUD_CONFIGFILE at an empty file isolates the test from the user's own overlay settings.
         conf = os.path.join(tmp, "empty.conf")
         open(conf, "w").close()
         logdir = os.path.join(tmp, "logs")
@@ -132,7 +152,10 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
         env.update(mh_env)
         env["MANGOHUD_CONFIGFILE"] = conf
         # Start logging after 1 s and stop a little before the scene ends so the log file is flushed and closed cleanly.
+        # log_duration is shorter than the scene (seconds minus 4, at least 2) so MangoHud closes the CSV cleanly before the process is stopped.
         env["MANGOHUD_CONFIG"] = "output_folder=%s,autostart_log=1,log_duration=%d,log_interval=0" % (logdir, max(2, seconds - 4))
+
+        # The two scenes take different flags; a small 640x360 window keeps GPU load light for a plumbing test.
         if chosen == "vkmark":
             scene_cmd = ["vkmark", "-b", "cube:duration=%d" % seconds, "-s", "640x360", "-p", "fifo"]
         else:
@@ -144,12 +167,14 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
         errlog = os.path.join(tmp, "stderr.txt")
         with open(errlog, "w") as ef:
             # start_new_session puts the child in its own process group, which is what _stop_group signals.
+            # Output goes to a file, not a pipe, so a chatty scene cannot fill a pipe buffer and block while we are not reading.
             proc = subprocess.Popen(cmd, env=env, stdout=ef, stderr=subprocess.STDOUT, start_new_session=True)
         L.append("Started process group %d (the only one this test will signal)." % proc.pid)
         start = time.time()
         stop_reason = None
         hot_msg = None
         # Supervise loop: stop when the scene exits, the time limit passes, or the thermal guard trips; poll twice a second.
+        # The loop is the whole bounded-run guarantee: every exit path (finished, timed out, too hot) is explicit and then _stop_group runs.
         while True:
             if proc.poll() is not None:
                 stop_reason = "scene finished by itself"
@@ -157,17 +182,22 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
             if time.time() - start >= seconds + 3:
                 stop_reason = "time limit reached"
                 break
+
+            # starting=False: this judges a run in progress, so only PAUSE and ABORT limits apply.
             st, hot_msg = thermal.evaluate(*(lambda x: (x["gpu_c"], x["cpu_c"]))(sample()), False, limits)
             if st in (thermal.PAUSE, thermal.ABORT):
                 stop_reason = "thermal guard stopped it: " + hot_msg
                 res["status"] = "ABORTED_HOT"
                 break
             time.sleep(0.5)
+
+        # Always called, even when the scene already exited, to clean up any orphaned children.
         _stop_group(proc)
         L.append("Stopped: %s. Ran %.1f s." % (stop_reason, time.time() - start))
         if res["status"] == "ABORTED_HOT":
             return res
         # A run that produced no frame log is a real FAILED result: the measuring chain is broken.
+        # Summary files are excluded for the same reason as in report.expand: they are not frame logs.
         logs = [p for p in glob.glob(os.path.join(logdir, "*.csv")) if not p.endswith("_summary.csv")]
         # Keep the last 600 characters of the run's output for failure diagnostics.
         tail = ""
@@ -189,6 +219,8 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
             res["status"] = "FAILED"
             L.append("FAILED: a log was written but could not be read: %s" % exc)
             return res
+
+        # Using the real stats code on the log tests the same path a game report will take.
         m = stats.run_metrics(log.frametimes_ms)
         res["status"] = "OK"
         res["stats"] = m
@@ -196,6 +228,7 @@ def run(seconds=10, scene="auto", mangohud_path=None, allow_unknown_temp=False, 
         L.append("Average FPS %.1f, median FPS %.1f, 1%% low FPS %.1f, 0.1%% low FPS %.1f, 99th percentile frame time %.2f ms." % (
             m["avg_fps"], m["median_fps"], m["low1_fps"], m["low01_fps"], m["p99_ms"]))
         # Headless gamescope is vsync-limited to 60 Hz; explain so users don't read it as GPU speed.
+        # Headless gamescope paces to 60 Hz, so ~60 FPS says nothing about GPU speed; the note prevents a misreading.
         if m["avg_fps"] < 62 and m["avg_fps"] > 58:
             L.append("Note: about 60 FPS means the headless screen's 60 Hz refresh limited the scene, not the GPU. The FPS number shows the chain works; it is not a speed score.")
         L.append("This only shows that measuring works on this PC. It says nothing about any game or any tuning.")
